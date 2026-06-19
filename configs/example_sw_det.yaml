@@ -1,0 +1,56 @@
+paths:
+  data_root: subprojects/ckdmip_nlpq_suite/data
+  run_root: subprojects/ckdmip_nlpq_suite/runs
+  ckdmip_bin: subprojects/ckdmip_nlpq_suite/external/ckdmip/bin
+  py2sess_repo: subprojects/ckdmip_nlpq_suite/external/py2sess
+
+run:
+  domain: sw
+  bands: [2]
+  run_id: pilot_sw_band02_det
+  datasets: [evaluation1, evaluation2]
+  scenarios: [present]
+  profile_blocks: ["1-10", "11-20", "21-30", "31-40", "41-50"]
+
+split:
+  dev:
+    train_profiles: "0-39"
+    val_profiles: "40-49"
+  final:
+    train_profiles: "0-49"
+    test_dataset: evaluation2
+    test_profiles: "0-49"
+
+nlpq:
+  methods: [det]
+  q_values: [6, 9, 12, 16]
+  train_pressure_min_hpa: 0.001
+  train_pressure_max_hpa: 1100.0
+  seed: 19
+
+training:
+  steps: 220
+  lr: 0.05
+  dtype: float32
+  device: cuda
+  checkpoint_every_steps: 25
+
+tuning:
+  datasets: [evaluation1]
+  require_ckdmip_rt_for_selection: true
+  grid:
+    lr: [0.05]
+    steps: [220]
+    train_pressure_min_hpa: [0.001]
+  score_weights:
+    toa_flux: 1.0
+    surface_flux: 1.0
+    heating_upper: 1.0
+    heating_lower: 1.0
+    runtime: 0.0
+
+rt:
+  train_teacher: py2sess
+  final_solver: ckdmip
+  mu_values: [0.1, 0.3, 0.5, 0.7, 0.9]
+  allow_zero_rayleigh: false

@@ -1,0 +1,35 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# CKDMIP data and generated products
+data/
+work/
+runs/
+outputs/
+external/
+
+# Large scientific artifacts
+*.h5
+*.hdf5
+*.nc
+*.npz
+*.npy
+*.part
+
+# Scheduler and runtime logs
+slurm-*.out
+*.log
+*.err
+*.out
+
+# macOS
+.DS_Store
