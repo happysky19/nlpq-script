@@ -506,7 +506,7 @@ def training_options_for_candidate(config: RunConfig, selected: dict[str, Any]) 
     if config.domain == "sw":
         options["mu_values"] = [float(v) for v in rt_options.get("mu_values", options.get("mu_values", [0.5]))]
         options["surf_albedo"] = float(rt_options.get("surf_albedo", options.get("surf_albedo", 0.15)))
-        options["include_fo"] = bool(rt_options.get("sw_include_fo", options.get("include_fo", True)))
+        options["include_fo"] = bool(rt_options.get("sw_include_fo", options.get("include_fo", False)))
         options["allow_zero_rayleigh"] = bool(
             rt_options.get("allow_zero_rayleigh", options.get("allow_zero_rayleigh", False))
         )

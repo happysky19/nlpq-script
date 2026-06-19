@@ -134,7 +134,7 @@ class MinimalWorkflowTest(unittest.TestCase):
                     "streams": 2,
                     "mu_values": [0.5],
                     "surf_albedo": 0.1,
-                    "include_fo": True,
+                    "include_fo": False,
                     "train_pressure_min_hpa": 0.001,
                     "train_pressure_max_hpa": 1100.0,
                 },
@@ -151,6 +151,7 @@ class MinimalWorkflowTest(unittest.TestCase):
         self.assertEqual(training_log["rt_aware_training"], "optimized")
         self.assertEqual(training_log["teacher_kernel"], "py2sess_forward_flux_sw")
         self.assertEqual(training_log["mu_values"], [0.5])
+        self.assertFalse(training_log["include_fo"])
 
     def test_sw_rt_aware_requires_source_terms(self) -> None:
         batch = native_batch(profile_count=2, spectral_count=4)
@@ -166,6 +167,25 @@ class MinimalWorkflowTest(unittest.TestCase):
                         "lr": 0.02,
                         "dtype": "float32",
                         "device": "cpu",
+                    },
+                    py2sess_repo=repo,
+                )
+
+    def test_sw_rt_aware_rejects_fo_flux_training(self) -> None:
+        batch = sw_native_batch(profile_count=2, spectral_count=4)
+        model = NLPQModel(domain="sw", band=2, method="rt-aware", q_value=2, seed=4)
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = write_fake_py2sess_repo(Path(repo_dir))
+            with self.assertRaisesRegex(ValueError, "plane-parallel flux-only"):
+                model.fit(
+                    batch,
+                    training_config={
+                        "rt_train_teacher": "py2sess",
+                        "steps": 1,
+                        "lr": 0.02,
+                        "dtype": "float32",
+                        "device": "cpu",
+                        "include_fo": True,
                     },
                     py2sess_repo=repo,
                 )

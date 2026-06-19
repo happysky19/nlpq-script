@@ -28,10 +28,12 @@ the directory containing `ckdmip_sw` and `ckdmip_lw`.
 The `det` and `rt-aware` paths support longwave and shortwave. `rt-aware`
 trains a frozen assignment with py2sess `forward_flux` as the differentiable
 flux/heating teacher when `rt.train_teacher: py2sess`. Longwave uses the
-thermal source terms. Shortwave uses absorption optical depth, Rayleigh optical
-depth, CKDMIP solar irradiance, configured `rt.mu_values`, and surface albedo.
-Formal validation and final scoring still use CKDMIP `ckdmip_lw` or
-`ckdmip_sw`, not py2sess.
+thermal source terms. Shortwave uses plane-parallel flux-only solar training
+with absorption optical depth, Rayleigh optical depth, CKDMIP solar irradiance,
+configured `rt.mu_values`, and surface albedo. SW heating loss uses net-flux
+divergence; SW flux loss still compares upwelling and downwelling fluxes to
+avoid cancellation. Formal validation and final scoring still use CKDMIP
+`ckdmip_lw` or `ckdmip_sw`, not py2sess.
 
 ## Configure
 
@@ -163,6 +165,8 @@ loads the frozen final model and writes test vertical outputs from Evaluation-2.
 - SW `rt-aware` requires official CKDMIP Rayleigh optical depth and solar
   irradiance unless `rt.allow_zero_rayleigh: true` is explicitly set for a
   diagnostic run.
+- SW `rt-aware` uses py2sess plane-parallel flux-only training; keep
+  `rt.sw_include_fo: false`.
 - Evaluation-2 must not appear in tuning.
 - Train/validation profile leakage is rejected.
 - Dev tuning exports frozen candidates, runs CKDMIP RT, and ranks on flux and

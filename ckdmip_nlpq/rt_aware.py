@@ -280,7 +280,9 @@ def train_sw_rt_aware_assignment(
     streams = int(options.get("streams", options.get("sw_streams", 4)))
     cp_air = float(options.get("cp_air_j_kg_k", 1004.0))
     surf_albedo = float(options.get("surf_albedo", 0.15))
-    include_fo = bool(options.get("include_fo", options.get("sw_include_fo", True)))
+    include_fo = bool(options.get("include_fo", options.get("sw_include_fo", False)))
+    if include_fo:
+        raise ValueError("SW rt-aware training uses plane-parallel flux-only forward_flux; set sw_include_fo=false")
     stream_value = float(options.get("stream", 1.0 / math.sqrt(3.0)))
     flux_weight = float(options.get("flux_loss_weight", 1.0))
     heating_weight = float(options.get("heating_loss_weight", 1.0))
@@ -594,7 +596,7 @@ def py2sess_forward_flux_sw(
             upwelling=True,
             downwelling=True,
             delta_scaling=False,
-            plane_parallel=not include_fo,
+            plane_parallel=True,
             fo_flux_n_mu=int(streams),
             torch_dtype=dtype_name,
             torch_enable_grad=True,
@@ -623,16 +625,17 @@ def py2sess_forward_flux_sw(
             fbeam=incoming_rows,
             albedo=albedo_rows,
             include_fo=include_fo,
-            geometry="pseudo_spherical",
             return_net=True,
         )
         up_rows = _flux_rows(result.flux_up, row_count)
         down_rows = _flux_rows(result.flux_down, row_count)
+        net_rows = _net_flux_rows(result, up_rows, down_rows, row_count)
         up_bqk = up_rows.reshape(batch, q_count, layers + 1)
         down_bqk = down_rows.reshape(batch, q_count, layers + 1)
+        net_bqk = net_rows.reshape(batch, q_count, layers + 1)
         up_flux = up_bqk.sum(dim=1)
         down_flux = down_bqk.sum(dim=1)
-        net_flux = up_flux - down_flux
+        net_flux = net_bqk.sum(dim=1)
         dp = torch.diff(pressure_hl_pa, dim=1).clamp_min(EPS)
         heating = (net_flux[:, 1:] - net_flux[:, :-1]) * GRAVITY_M_S2 * SECONDS_PER_DAY / float(cp_air_j_kg_k) / dp
         up_by_mu.append(up_flux)
@@ -742,6 +745,13 @@ def _flux_rows(value: Any, row_count: int) -> Any:
             return rows[0, :, :]
         return rows.reshape(row_count, -1, rows.shape[-1])[:, 0, :]
     raise ValueError("py2sess forward_flux returned unsupported flux shape")
+
+
+def _net_flux_rows(result: Any, up_rows: Any, down_rows: Any, row_count: int) -> Any:
+    net = getattr(result, "flux_net", None)
+    if net is None:
+        return up_rows - down_rows
+    return _flux_rows(net, row_count)
 
 
 def _torch_dtype(name: str, torch: Any) -> Any:
