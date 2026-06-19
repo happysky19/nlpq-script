@@ -119,8 +119,6 @@ def dev_tune(config: RunConfig, *, band: int, dry_run: bool = False) -> None:
         write_csv(paths.metric_path("dev_tuning_ranked"), ranked)
         write_selected_settings(paths.run_dir / "selected_settings.yaml", paths.run_dir / "selected_settings.json", ranked)
         return
-    ensure_training_supported(config, method=None)
-
     train = load_batch_for_split(config, band=band, split="dev_train")
     val = load_batch_for_split(config, band=band, split="dev_val")
     rows: list[dict[str, Any]] = []
@@ -218,7 +216,6 @@ def dev_tune(config: RunConfig, *, band: int, dry_run: bool = False) -> None:
 def final_train(config: RunConfig, *, band: int, dry_run: bool = False) -> None:
     paths = build_output_paths(config, band)
     selected = load_selected(paths.run_dir / "selected_settings.json")
-    ensure_training_supported(config, method=str(selected["method"]))
     if dry_run:
         write_csv(
             paths.metric_path("final_train_log"),
@@ -493,12 +490,6 @@ def load_selected(path: Path) -> dict[str, Any]:
     return dict(payload["selected"])
 
 
-def ensure_training_supported(config: RunConfig, *, method: str | None) -> None:
-    methods = [method] if method is not None else config.methods
-    if config.domain == "sw" and "rt-aware" in methods:
-        raise NotImplementedError("rt-aware training is currently implemented for longwave only")
-
-
 def training_options_for_candidate(config: RunConfig, selected: dict[str, Any]) -> dict[str, Any]:
     options = dict(config.raw.get("training", {}))
     rt_options = config.raw.get("rt", {})
@@ -510,7 +501,15 @@ def training_options_for_candidate(config: RunConfig, selected: dict[str, Any]) 
         selected.get("train_pressure_min_hpa", nlpq_options.get("train_pressure_min_hpa", 0.001))
     )
     options["train_pressure_max_hpa"] = float(nlpq_options.get("train_pressure_max_hpa", 1100.0))
-    options["streams"] = int(rt_options.get("lw_streams", options.get("streams", 4)))
+    stream_key = "sw_streams" if config.domain == "sw" else "lw_streams"
+    options["streams"] = int(rt_options.get(stream_key, rt_options.get("streams", options.get("streams", 4))))
+    if config.domain == "sw":
+        options["mu_values"] = [float(v) for v in rt_options.get("mu_values", options.get("mu_values", [0.5]))]
+        options["surf_albedo"] = float(rt_options.get("surf_albedo", options.get("surf_albedo", 0.15)))
+        options["include_fo"] = bool(rt_options.get("sw_include_fo", options.get("include_fo", True)))
+        options["allow_zero_rayleigh"] = bool(
+            rt_options.get("allow_zero_rayleigh", options.get("allow_zero_rayleigh", False))
+        )
     return options
 
 
@@ -533,6 +532,9 @@ def training_summary_fields(metadata: dict[str, Any]) -> dict[str, Any]:
         "teacher_heating_loss_final",
         "train_pressure_min_hpa",
         "train_pressure_max_hpa",
+        "mu_values",
+        "surf_albedo",
+        "include_fo",
     ):
         if key in log:
             fields[key] = log[key]

@@ -25,12 +25,13 @@ python -m pip install -e ".[torch]"
 Build or install the CKDMIP tools and set the YAML `paths.ckdmip_bin` value to
 the directory containing `ckdmip_sw` and `ckdmip_lw`.
 
-The `det` path supports longwave and shortwave. The `rt-aware` path is currently
-implemented for longwave only: it trains a frozen assignment with py2sess
-`forward_flux` as the differentiable thermal flux/heating teacher when
-`rt.train_teacher: py2sess`, and still uses CKDMIP `ckdmip_lw` for formal
-validation and final scoring. Shortwave `rt-aware` is intentionally disabled
-until the solar/Rayleigh teacher path is added.
+The `det` and `rt-aware` paths support longwave and shortwave. `rt-aware`
+trains a frozen assignment with py2sess `forward_flux` as the differentiable
+flux/heating teacher when `rt.train_teacher: py2sess`. Longwave uses the
+thermal source terms. Shortwave uses absorption optical depth, Rayleigh optical
+depth, CKDMIP solar irradiance, configured `rt.mu_values`, and surface albedo.
+Formal validation and final scoring still use CKDMIP `ckdmip_lw` or
+`ckdmip_sw`, not py2sess.
 
 ## Configure
 
@@ -40,7 +41,13 @@ Copy and edit the longwave `det + rt-aware` example:
 cp subprojects/ckdmip_nlpq_suite/configs/example.yaml run_lw_band04.yaml
 ```
 
-For a shortwave deterministic run, start from:
+For a shortwave `det + rt-aware` run, start from:
+
+```bash
+cp subprojects/ckdmip_nlpq_suite/configs/example_sw.yaml run_sw_band02.yaml
+```
+
+For a shortwave deterministic-only run, start from:
 
 ```bash
 cp subprojects/ckdmip_nlpq_suite/configs/example_sw_det.yaml run_sw_band02.yaml
@@ -151,10 +158,11 @@ loads the frozen final model and writes test vertical outputs from Evaluation-2.
 - Missing CKDMIP executables fail preflight.
 - Missing py2sess or missing `TwoStreamEss.forward_flux` fails preflight when
   `rt-aware` is requested.
-- `rt-aware` with `run.domain: sw` fails before training; use SW `det` until
-  the solar/Rayleigh teacher is implemented.
 - Missing official CKDMIP spectra or flux truth fails outside download/dry-run
   stages.
+- SW `rt-aware` requires official CKDMIP Rayleigh optical depth and solar
+  irradiance unless `rt.allow_zero_rayleigh: true` is explicitly set for a
+  diagnostic run.
 - Evaluation-2 must not appear in tuning.
 - Train/validation profile leakage is rejected.
 - Dev tuning exports frozen candidates, runs CKDMIP RT, and ranks on flux and

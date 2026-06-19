@@ -118,6 +118,58 @@ class MinimalWorkflowTest(unittest.TestCase):
                     py2sess_repo=repo,
                 )
 
+    def test_sw_rt_aware_model_trains_and_exports_source_terms(self) -> None:
+        batch = sw_native_batch(profile_count=3, spectral_count=6)
+        model = NLPQModel(domain="sw", band=2, method="rt-aware", q_value=3, seed=5)
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = write_fake_py2sess_repo(Path(repo_dir))
+            model.fit(
+                batch,
+                training_config={
+                    "rt_train_teacher": "py2sess",
+                    "steps": 2,
+                    "lr": 0.02,
+                    "dtype": "float32",
+                    "device": "cpu",
+                    "streams": 2,
+                    "mu_values": [0.5],
+                    "surf_albedo": 0.1,
+                    "include_fo": True,
+                    "train_pressure_min_hpa": 0.001,
+                    "train_pressure_max_hpa": 1100.0,
+                },
+                py2sess_repo=repo,
+            ).freeze()
+        compressed = model.apply(batch)
+        self.assertEqual(compressed.tau_q.shape, (3, 3, 3))
+        self.assertEqual(compressed.rayleigh_tau_q.shape, (3, 3, 3))
+        self.assertEqual(compressed.incoming_flux_q.shape, (3,))
+        self.assertTrue(np.all(compressed.tau_q >= 0.0))
+        self.assertTrue(np.all(compressed.rayleigh_tau_q >= 0.0))
+        self.assertTrue(np.all(compressed.incoming_flux_q >= 0.0))
+        training_log = model.metadata["training_log"]
+        self.assertEqual(training_log["rt_aware_training"], "optimized")
+        self.assertEqual(training_log["teacher_kernel"], "py2sess_forward_flux_sw")
+        self.assertEqual(training_log["mu_values"], [0.5])
+
+    def test_sw_rt_aware_requires_source_terms(self) -> None:
+        batch = native_batch(profile_count=2, spectral_count=4)
+        model = NLPQModel(domain="sw", band=2, method="rt-aware", q_value=2, seed=4)
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = write_fake_py2sess_repo(Path(repo_dir))
+            with self.assertRaisesRegex(ValueError, "incoming_flux_native"):
+                model.fit(
+                    batch,
+                    training_config={
+                        "rt_train_teacher": "py2sess",
+                        "steps": 1,
+                        "lr": 0.02,
+                        "dtype": "float32",
+                        "device": "cpu",
+                    },
+                    py2sess_repo=repo,
+                )
+
     def test_tuner_ranking_and_selected_settings(self) -> None:
         rows = [
             {"candidate_id": 0, "method": "det", "q_value": 9, "tau_rmse": 0.2, "runtime_ms_per_profile": 1.0},
@@ -146,12 +198,6 @@ class MinimalWorkflowTest(unittest.TestCase):
             self.assertIn("--scenario", commands[0]["command"])
             report = paths.report_path().read_text()
             self.assertIn("Evaluation-2", report)
-
-    def test_sw_rt_aware_is_explicitly_gated(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cfg = load_run_config(write_config(Path(tmpdir), methods=["rt-aware"]))
-            with self.assertRaisesRegex(NotImplementedError, "longwave only"):
-                run_stage(cfg, stage="dev_tune", dry_run=False)
 
     def test_metrics_and_vertical_outputs_align_profile_subset(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -274,16 +320,57 @@ def native_batch(*, profile_count: int, spectral_count: int) -> NativeBatch:
     )
 
 
+def sw_native_batch(*, profile_count: int, spectral_count: int) -> NativeBatch:
+    batch = native_batch(profile_count=profile_count, spectral_count=spectral_count)
+    rayleigh = 0.002 + 0.0002 * np.arange(spectral_count)[None, None, :]
+    rayleigh = np.broadcast_to(rayleigh, batch.tau_native.shape)
+    incoming = 0.5 + 0.1 * np.arange(spectral_count, dtype=np.float64)
+    return NativeBatch(
+        profile_ids=batch.profile_ids,
+        pressure_hl=batch.pressure_hl,
+        temperature_hl=batch.temperature_hl,
+        wavenumber=batch.wavenumber,
+        spectral_weight=batch.spectral_weight,
+        tau_native=batch.tau_native,
+        rayleigh_tau_native=rayleigh,
+        incoming_flux_native=incoming,
+    )
+
+
 def write_fake_py2sess_repo(root: Path, *, include_forward_flux: bool = True) -> Path:
     package = root / "src" / "py2sess"
     package.mkdir(parents=True)
     forward_flux = ""
     if include_forward_flux:
         forward_flux = '''
-    def forward_flux(self, *, tau, ssa, g, z=None, angles=None, stream=None, planck=None,
-                     surface_planck=0.0, emissivity=1.0, albedo=0.0,
+    def forward_flux(self, *, tau, ssa, g, z=None, angles=None, stream=None, fbeam=1.0,
+                     planck=None, surface_planck=0.0, emissivity=1.0, albedo=0.0,
                      include_fo=False, return_net=False, **_kwargs):
         import torch
+        class Result:
+            pass
+        result = Result()
+        if planck is None:
+            trans = torch.exp(-torch.clamp(tau * (1.0 - 0.5 * torch.clamp(ssa, 0.0, 1.0)), min=0.0, max=80.0))
+            down = torch.as_tensor(fbeam, dtype=tau.dtype, device=tau.device)
+            if down.ndim == 0:
+                down = down.expand(tau.shape[0])
+            down_levels = [down]
+            for layer in range(tau.shape[1]):
+                down = down * trans[:, layer]
+                down_levels.append(down)
+            surf_albedo = torch.as_tensor(albedo, dtype=tau.dtype, device=tau.device)
+            if surf_albedo.ndim == 0:
+                surf_albedo = surf_albedo.expand(tau.shape[0])
+            up = surf_albedo * down
+            up_levels = [up]
+            for layer in range(tau.shape[1] - 1, -1, -1):
+                up = up * trans[:, layer]
+                up_levels.append(up)
+            result.flux_up = torch.stack(list(reversed(up_levels)), dim=1)
+            result.flux_down = torch.stack(down_levels, dim=1)
+            result.flux_net = result.flux_up - result.flux_down if return_net else None
+            return result
         trans = torch.exp(-torch.clamp(tau, min=0.0, max=80.0))
         down = torch.zeros(tau.shape[0], dtype=tau.dtype, device=tau.device)
         down_levels = [down]
@@ -295,14 +382,9 @@ def write_fake_py2sess_repo(root: Path, *, include_forward_flux: bool = True) ->
         for layer in range(tau.shape[1] - 1, -1, -1):
             up = up * trans[:, layer] + planck[:, layer + 1] * (1.0 - trans[:, layer])
             up_levels.append(up)
-        flux_up = torch.stack(list(reversed(up_levels)), dim=1)
-        flux_down = torch.stack(down_levels, dim=1)
-        class Result:
-            pass
-        result = Result()
-        result.flux_up = flux_up
-        result.flux_down = flux_down
-        result.flux_net = flux_up - flux_down if return_net else None
+        result.flux_up = torch.stack(list(reversed(up_levels)), dim=1)
+        result.flux_down = torch.stack(down_levels, dim=1)
+        result.flux_net = result.flux_up - result.flux_down if return_net else None
         return result
 '''
     (package / "__init__.py").write_text(
