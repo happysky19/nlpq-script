@@ -86,6 +86,8 @@ class CKDMIPNativeBatch:
     wavenumber: np.ndarray
     spectral_weight: np.ndarray
     tau_native: np.ndarray
+    species_tau_native: np.ndarray | None = None
+    species_names: tuple[str, ...] = ()
     rayleigh_tau_native: np.ndarray | None = None
     incoming_flux_native: np.ndarray | None = None
 
@@ -318,6 +320,8 @@ def load_native_batch_from_npz(path: str | Path) -> CKDMIPNativeBatch:
     with np.load(path, allow_pickle=False) as data:
         rayleigh = np.asarray(data["rayleigh_tau_native"], dtype=np.float64) if "rayleigh_tau_native" in data.files else None
         incoming = np.asarray(data["incoming_flux_native"], dtype=np.float64) if "incoming_flux_native" in data.files else None
+        species_tau = np.asarray(data["species_tau_native"], dtype=np.float64) if "species_tau_native" in data.files else None
+        species_names = tuple(str(v) for v in np.asarray(data["species_names"]).tolist()) if "species_names" in data.files else ()
         return CKDMIPNativeBatch(
             profile_ids=np.asarray(data["profile_ids"], dtype=np.int64),
             pressure_hl=np.asarray(data["pressure_hl"], dtype=np.float64),
@@ -325,6 +329,8 @@ def load_native_batch_from_npz(path: str | Path) -> CKDMIPNativeBatch:
             wavenumber=np.asarray(data["wavenumber"], dtype=np.float64),
             spectral_weight=np.asarray(data["spectral_weight"], dtype=np.float64),
             tau_native=np.asarray(data["tau_native"], dtype=np.float64),
+            species_tau_native=species_tau,
+            species_names=species_names,
             rayleigh_tau_native=rayleigh,
             incoming_flux_native=incoming,
         )
@@ -350,6 +356,7 @@ def load_native_batch_from_ckdmip(
         raise ValueError("profile selection is empty")
 
     tau_parts: list[np.ndarray] = []
+    species_names: list[str] = []
     rayleigh_parts: list[np.ndarray] = []
     pressure_by_profile: dict[int, np.ndarray] = {}
     temperature_by_profile: dict[int, np.ndarray] = {}
@@ -392,12 +399,15 @@ def load_native_batch_from_ckdmip(
             rayleigh_parts.append(stacked)
         else:
             tau_parts.append(stacked)
+            species_names.append(gas)
 
     if selected_wavenumber is None:
         raise ValueError("no spectra loaded")
     if tau_parts:
-        tau_native = np.sum(np.stack(tau_parts, axis=0), axis=0)
+        species_tau_native = np.stack(tau_parts, axis=2)
+        tau_native = np.sum(species_tau_native, axis=2)
     elif rayleigh_parts:
+        species_tau_native = None
         tau_native = np.zeros_like(rayleigh_parts[0])
     else:
         raise ValueError("no absorbing optical-depth spectra loaded")
@@ -422,6 +432,8 @@ def load_native_batch_from_ckdmip(
         wavenumber=selected_wavenumber,
         spectral_weight=spectral_weight,
         tau_native=tau_native,
+        species_tau_native=species_tau_native,
+        species_names=tuple(species_names),
         rayleigh_tau_native=rayleigh_tau_native,
         incoming_flux_native=incoming_flux_native,
     )

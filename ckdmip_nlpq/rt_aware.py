@@ -15,6 +15,7 @@ from .rt import check_py2sess_forward_flux_available
 
 EPS = 1.0e-12
 GRAVITY_M_S2 = 9.80665
+DRY_AIR_GAS_CONSTANT_J_KG_K = 287.05
 SECONDS_PER_DAY = 86400.0
 
 
@@ -63,6 +64,7 @@ def train_rt_aware_assignment(
     tau = torch.tensor(np.maximum(batch.tau_native, 0.0), dtype=dtype, device=device)
     alpha = torch.tensor(_positive_normalized(batch.spectral_weight), dtype=dtype, device=device)
     pressure_hl = torch.tensor(batch.pressure_hl, dtype=dtype, device=device)
+    temperature_hl = torch.tensor(batch.temperature_hl, dtype=dtype, device=device)
     source_level = _planck_level_source(batch, dtype=dtype, device=device, torch=torch)
     source_layer = 0.5 * (source_level[:, :-1, :] + source_level[:, 1:, :])
     surface_source = source_level[:, -1, :]
@@ -110,6 +112,7 @@ def train_rt_aware_assignment(
             source_level,
             surface_source,
             pressure_hl,
+            temperature_hl,
             streams=streams,
             cp_air_j_kg_k=cp_air,
             py2sess_repo=py2sess_repo,
@@ -157,6 +160,7 @@ def train_rt_aware_assignment(
             source_level_q,
             surface_q,
             pressure_hl,
+            temperature_hl,
             streams=streams,
             cp_air_j_kg_k=cp_air,
             py2sess_repo=py2sess_repo,
@@ -262,6 +266,7 @@ def train_sw_rt_aware_assignment(
     incoming = _incoming_flux_tensor(batch, dtype=dtype, device=device, torch=torch)
     alpha = torch.tensor(_positive_normalized(batch.spectral_weight), dtype=dtype, device=device)
     pressure_hl = torch.tensor(batch.pressure_hl, dtype=dtype, device=device)
+    temperature_hl = torch.tensor(batch.temperature_hl, dtype=dtype, device=device)
 
     m_count = int(tau_abs.shape[-1])
     if q_value > m_count:
@@ -311,6 +316,7 @@ def train_sw_rt_aware_assignment(
             rayleigh,
             incoming,
             pressure_hl,
+            temperature_hl,
             mu_values=mu_values,
             surf_albedo=surf_albedo,
             include_fo=include_fo,
@@ -358,6 +364,7 @@ def train_sw_rt_aware_assignment(
             rayleigh_q,
             incoming_q,
             pressure_hl,
+            temperature_hl,
             mu_values=mu_values,
             surf_albedo=surf_albedo,
             include_fo=include_fo,
@@ -496,6 +503,7 @@ def py2sess_forward_flux_rt(
     source_level_bkq: Any,
     surface_source_bq: Any,
     pressure_hl_pa: Any,
+    temperature_hl_k: Any,
     *,
     streams: int,
     cp_air_j_kg_k: float,
@@ -531,7 +539,7 @@ def py2sess_forward_flux_rt(
         tau=tau_rows,
         ssa=zeros,
         g=zeros,
-        z=_height_grid_from_pressure(pressure_hl_pa),
+        z=_hydrostatic_height_grid(pressure_hl_pa, temperature_hl_k),
         angles=[0.0],
         stream=1.0 / math.sqrt(3.0),
         planck=source_rows,
@@ -561,6 +569,7 @@ def py2sess_forward_flux_sw(
     rayleigh_blq: Any,
     incoming_bq: Any,
     pressure_hl_pa: Any,
+    temperature_hl_k: Any,
     *,
     mu_values: list[float],
     surf_albedo: float,
@@ -608,7 +617,7 @@ def py2sess_forward_flux_sw(
     g_rows = g_blq.permute(0, 2, 1).reshape(row_count, layers).contiguous()
     incoming_rows = incoming_bq.reshape(row_count).contiguous()
     albedo_rows = torch.full((row_count,), float(surf_albedo), dtype=tau_abs_blq.dtype, device=tau_abs_blq.device)
-    height_grid = _height_grid_from_pressure(pressure_hl_pa)
+    height_grid = _hydrostatic_height_grid(pressure_hl_pa, temperature_hl_k)
     up_by_mu = []
     down_by_mu = []
     heat_by_mu = []
@@ -723,13 +732,49 @@ def _incoming_flux_tensor(batch: NativeBatch, *, dtype: Any, device: Any, torch:
     return torch.tensor(np.maximum(incoming, 0.0), dtype=dtype, device=device)
 
 
-def _height_grid_from_pressure(pressure_hl_pa: Any) -> np.ndarray:
-    pressure = np.asarray(pressure_hl_pa.detach().cpu().numpy(), dtype=np.float64)
+def _hydrostatic_height_grid(pressure_hl_pa: Any, temperature_hl_k: Any) -> np.ndarray:
+    pressure = _to_numpy(pressure_hl_pa)
+    temperature = _to_numpy(temperature_hl_k)
     mean_pressure = np.mean(pressure, axis=0) if pressure.ndim == 2 else pressure
-    surface_pressure = float(mean_pressure[-1])
-    height = 7.0 * np.log(surface_pressure / np.clip(mean_pressure, EPS, None))
-    height[-1] = 0.0
+    mean_temperature = np.mean(temperature, axis=0) if temperature.ndim == 2 else temperature
+    if mean_pressure.shape != mean_temperature.shape:
+        raise ValueError("pressure_hl_pa and temperature_hl_k must have matching level dimensions")
+    if mean_pressure.ndim != 1 or mean_pressure.size < 2:
+        raise ValueError("height grid requires at least two half levels")
+
+    pressure_clipped = np.clip(mean_pressure.astype(np.float64), EPS, None)
+    temperature_clipped = np.clip(mean_temperature.astype(np.float64), 1.0, None)
+    layer_temperature = 0.5 * (temperature_clipped[:-1] + temperature_clipped[1:])
+    height = np.zeros_like(pressure_clipped)
+    if pressure_clipped[-1] >= pressure_clipped[0]:
+        height[-1] = 0.0
+        layer_dz_km = (
+            DRY_AIR_GAS_CONSTANT_J_KG_K
+            * layer_temperature
+            / GRAVITY_M_S2
+            * np.log(pressure_clipped[1:] / pressure_clipped[:-1])
+            / 1000.0
+        )
+        for idx in range(pressure_clipped.size - 2, -1, -1):
+            height[idx] = height[idx + 1] + max(float(layer_dz_km[idx]), 0.0)
+    else:
+        height[0] = 0.0
+        layer_dz_km = (
+            DRY_AIR_GAS_CONSTANT_J_KG_K
+            * layer_temperature
+            / GRAVITY_M_S2
+            * np.log(pressure_clipped[:-1] / pressure_clipped[1:])
+            / 1000.0
+        )
+        for idx in range(1, pressure_clipped.size):
+            height[idx] = height[idx - 1] + max(float(layer_dz_km[idx - 1]), 0.0)
     return height
+
+
+def _to_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.float64)
 
 
 def _flux_rows(value: Any, row_count: int) -> Any:

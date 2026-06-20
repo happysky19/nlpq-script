@@ -11,6 +11,7 @@ import numpy as np
 
 
 EPS = 1.0e-12
+ALLOWED_METHODS = {"det", "rt-aware", "rt-aware-nn"}
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,8 @@ class NativeBatch:
     wavenumber: np.ndarray
     spectral_weight: np.ndarray
     tau_native: np.ndarray
+    species_tau_native: np.ndarray | None = None
+    species_names: tuple[str, ...] = ()
     rayleigh_tau_native: np.ndarray | None = None
     incoming_flux_native: np.ndarray | None = None
 
@@ -47,8 +50,8 @@ class NLPQModel:
         seed: int = 0,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        if method not in {"det", "rt-aware"}:
-            raise ValueError("method must be det or rt-aware")
+        if method not in ALLOWED_METHODS:
+            raise ValueError(f"method must be one of {sorted(ALLOWED_METHODS)}")
         if q_value < 1:
             raise ValueError("q_value must be positive")
         self.domain = domain
@@ -59,6 +62,7 @@ class NLPQModel:
         self.metadata = dict(metadata or {})
         self.cluster_id: np.ndarray | None = None
         self.weight_q: np.ndarray | None = None
+        self.nn_state: dict[str, Any] | None = None
         self.frozen = False
 
     def fit(
@@ -77,7 +81,7 @@ class NLPQModel:
             cluster_id = np.arange(spectral_count, dtype=np.int64)
             weight_q = _cluster_weights(batch.spectral_weight, cluster_id, self.q_value)
             training_log: dict[str, Any] = {"assignment_training": "identity", "steps": 0}
-        elif self.method == "rt-aware":
+        elif self.method in ("rt-aware", "rt-aware-nn"):
             from .rt_aware import train_rt_aware_assignment
 
             cluster_id, weight_q, training_log = train_rt_aware_assignment(
@@ -88,6 +92,19 @@ class NLPQModel:
                 training_config=training_config,
                 py2sess_repo=py2sess_repo,
             )
+            if self.method == "rt-aware-nn" and self.q_value < spectral_count:
+                from .nn_tau import train_neural_overlap_residual
+
+                self.nn_state, nn_log = train_neural_overlap_residual(
+                    batch,
+                    cluster_id=cluster_id,
+                    weight_q=weight_q,
+                    q_value=self.q_value,
+                    training_config=training_config,
+                    seed=self.seed,
+                )
+                training_log = dict(training_log)
+                training_log["neural_overlap"] = nn_log
         else:
             cluster_id = _contiguous_quantile_clusters(
                 batch.spectral_weight,
@@ -95,7 +112,7 @@ class NLPQModel:
                 score=_spectral_score(batch, self.method),
             )
             weight_q = _cluster_weights(batch.spectral_weight, cluster_id, self.q_value)
-            training_log = {"assignment_training": "deterministic_weighted_quantile", "steps": 0}
+            training_log = {"assignment_training": _assignment_training_name(self.method), "steps": 0}
         self.cluster_id = cluster_id
         self.weight_q = weight_q
         self.metadata.update(
@@ -124,6 +141,17 @@ class NLPQModel:
         if self.cluster_id is None or self.weight_q is None:
             raise RuntimeError("model has no assignment")
         tau_q = compress_tau(batch.tau_native, batch.spectral_weight, self.cluster_id, self.q_value)
+        if self.method == "rt-aware-nn" and self.nn_state is not None:
+            from .nn_tau import apply_neural_overlap_residual
+
+            tau_q = apply_neural_overlap_residual(
+                batch,
+                cluster_id=self.cluster_id,
+                weight_q=self.weight_q,
+                q_value=self.q_value,
+                nn_state=self.nn_state,
+                target_tau_q=tau_q,
+            )
         rayleigh_tau_q = None
         if batch.rayleigh_tau_native is not None:
             rayleigh_tau_q = compress_tau(
@@ -166,6 +194,7 @@ class NLPQModel:
             cluster_id=self.cluster_id,
             weight_q=self.weight_q,
             metadata_json=json.dumps(payload, sort_keys=True),
+            **_encode_nn_state(self.nn_state),
         )
 
     @classmethod
@@ -182,6 +211,7 @@ class NLPQModel:
             )
             model.cluster_id = np.asarray(data["cluster_id"], dtype=np.int64)
             model.weight_q = np.asarray(data["weight_q"], dtype=np.float64)
+            model.nn_state = _decode_nn_state(data)
             model.frozen = bool(metadata.get("frozen", True))
             return model
 
@@ -258,9 +288,37 @@ def _spectral_score(batch: NativeBatch, method: str) -> np.ndarray:
     tau = np.asarray(batch.tau_native, dtype=np.float64)
     if method == "det":
         return np.arange(tau.shape[-1], dtype=np.float64)
-    mean_tau = np.mean(tau, axis=tuple(range(tau.ndim - 1)))
-    spread_tau = np.std(tau, axis=tuple(range(tau.ndim - 1)))
-    return mean_tau + spread_tau
+    raise ValueError(f"unsupported deterministic assignment method: {method}")
+
+
+def _assignment_training_name(method: str) -> str:
+    if method == "det":
+        return "regular_native_index_binning"
+    return method
+
+
+def _encode_nn_state(nn_state: dict[str, Any] | None) -> dict[str, np.ndarray]:
+    if nn_state is None:
+        return {}
+    arrays = {key: value for key, value in nn_state.items() if isinstance(value, np.ndarray)}
+    metadata = {key: value for key, value in nn_state.items() if key not in arrays}
+    payload: dict[str, np.ndarray] = {
+        "nn_state_keys": np.asarray(list(arrays), dtype="U"),
+        "nn_metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
+    }
+    for key, value in arrays.items():
+        payload[f"nn_array_{key}"] = np.asarray(value)
+    return payload
+
+
+def _decode_nn_state(data: Any) -> dict[str, Any] | None:
+    if "nn_state_keys" not in data.files:
+        return None
+    metadata = json.loads(str(data["nn_metadata_json"])) if "nn_metadata_json" in data.files else {}
+    state: dict[str, Any] = dict(metadata)
+    for key in np.asarray(data["nn_state_keys"]).tolist():
+        state[str(key)] = np.asarray(data[f"nn_array_{key}"])
+    return state
 
 
 def _contiguous_quantile_clusters(spectral_weight: np.ndarray, q_value: int, *, score: np.ndarray) -> np.ndarray:

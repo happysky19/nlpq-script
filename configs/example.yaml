@@ -47,7 +47,6 @@ tuning:
     surface_flux: 1.0
     heating_upper: 1.0
     heating_lower: 1.0
-    runtime: 0.0
 
 rt:
   train_teacher: py2sess

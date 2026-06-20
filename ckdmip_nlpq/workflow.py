@@ -72,7 +72,7 @@ def preflight(config: RunConfig, *, band: int, dry_run: bool = False) -> None:
         check_ckdmip_executable(config, config.domain)
     except Exception as exc:
         errors.append(str(exc))
-    if "rt-aware" in config.methods:
+    if any(method in ("rt-aware", "rt-aware-nn") for method in config.methods):
         try:
             check_py2sess_forward_flux_available(config.py2sess_repo)
         except Exception as exc:
@@ -461,6 +461,8 @@ def subset_batch(batch: CKDMIPNativeBatch, profiles: list[int]) -> CKDMIPNativeB
         wavenumber=batch.wavenumber,
         spectral_weight=batch.spectral_weight,
         tau_native=batch.tau_native[positions],
+        species_tau_native=None if batch.species_tau_native is None else batch.species_tau_native[positions],
+        species_names=batch.species_names,
         rayleigh_tau_native=None if batch.rayleigh_tau_native is None else batch.rayleigh_tau_native[positions],
         incoming_flux_native=batch.incoming_flux_native,
     )
@@ -474,6 +476,8 @@ def to_model_batch(batch: CKDMIPNativeBatch) -> NativeBatch:
         wavenumber=batch.wavenumber,
         spectral_weight=batch.spectral_weight,
         tau_native=batch.tau_native,
+        species_tau_native=batch.species_tau_native,
+        species_names=batch.species_names,
         rayleigh_tau_native=batch.rayleigh_tau_native,
         incoming_flux_native=batch.incoming_flux_native,
     )

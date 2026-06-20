@@ -38,6 +38,11 @@ class MinimalWorkflowTest(unittest.TestCase):
             self.assertEqual(paths.model_path("det", 6, "final").name, "sw_band02_det_q6_final.npz")
             self.assertEqual(paths.metric_path("dev_tuning_ranked").name, "sw_band02_dev_tuning_ranked.csv")
 
+    def test_config_accepts_rt_aware_nn_method(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = load_run_config(write_config(Path(tmpdir), methods=["rt-aware-nn"]))
+            self.assertEqual(cfg.methods, ["rt-aware-nn"])
+
     def test_download_dry_run_plan_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -170,6 +175,41 @@ class MinimalWorkflowTest(unittest.TestCase):
                     },
                     py2sess_repo=repo,
                 )
+
+    def test_rt_aware_nn_trains_frozen_tau_residual(self) -> None:
+        batch = species_native_batch(profile_count=3, spectral_count=6)
+        model = NLPQModel(domain="lw", band=4, method="rt-aware-nn", q_value=3, seed=8)
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = write_fake_py2sess_repo(Path(repo_dir))
+            model.fit(
+                batch,
+                training_config={
+                    "rt_train_teacher": "py2sess",
+                    "steps": 2,
+                    "nn_steps": 3,
+                    "lr": 0.02,
+                    "nn_lr": 0.01,
+                    "dtype": "float32",
+                    "device": "cpu",
+                    "streams": 2,
+                    "train_pressure_min_hpa": 0.001,
+                    "train_pressure_max_hpa": 1100.0,
+                },
+                py2sess_repo=repo,
+            ).freeze()
+
+        compressed = model.apply(batch)
+        self.assertEqual(compressed.tau_q.shape, (3, 3, 3))
+        self.assertTrue(np.all(compressed.tau_q >= 0.0))
+        self.assertIsNotNone(model.nn_state)
+        self.assertEqual(model.metadata["training_log"]["neural_overlap"]["kind"], "q_space_species_overlap_tau_residual")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rt_aware_nn.npz"
+            model.save(path)
+            loaded = NLPQModel.load(path)
+            loaded_compressed = loaded.apply(batch)
+            np.testing.assert_allclose(loaded_compressed.tau_q, compressed.tau_q)
 
     def test_sw_rt_aware_rejects_fo_flux_training(self) -> None:
         batch = sw_native_batch(profile_count=2, spectral_count=4)
@@ -354,6 +394,26 @@ def sw_native_batch(*, profile_count: int, spectral_count: int) -> NativeBatch:
         tau_native=batch.tau_native,
         rayleigh_tau_native=rayleigh,
         incoming_flux_native=incoming,
+    )
+
+
+def species_native_batch(*, profile_count: int, spectral_count: int) -> NativeBatch:
+    batch = native_batch(profile_count=profile_count, spectral_count=spectral_count)
+    spectral = np.arange(spectral_count, dtype=np.float64)[None, None, :]
+    layer = np.arange(batch.tau_native.shape[1], dtype=np.float64)[None, :, None]
+    profile = np.arange(profile_count, dtype=np.float64)[:, None, None]
+    species_a = 0.006 + 0.0005 * profile + 0.0015 * layer + 0.0030 * spectral
+    species_b = 0.004 + 0.0007 * profile + 0.0010 * layer + 0.0020 * (spectral_count - spectral)
+    species_tau = np.stack([species_a, species_b], axis=2)
+    return NativeBatch(
+        profile_ids=batch.profile_ids,
+        pressure_hl=batch.pressure_hl,
+        temperature_hl=batch.temperature_hl,
+        wavenumber=batch.wavenumber,
+        spectral_weight=batch.spectral_weight,
+        tau_native=np.sum(species_tau, axis=2),
+        species_tau_native=species_tau,
+        species_names=("h2o", "co2"),
     )
 
 

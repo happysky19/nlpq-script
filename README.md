@@ -25,15 +25,26 @@ python -m pip install -e ".[torch]"
 Build or install the CKDMIP tools and set the YAML `paths.ckdmip_bin` value to
 the directory containing `ckdmip_sw` and `ckdmip_lw`.
 
-The `det` and `rt-aware` paths support longwave and shortwave. `rt-aware`
-trains a frozen assignment with py2sess `forward_flux` as the differentiable
-flux/heating teacher when `rt.train_teacher: py2sess`. Longwave uses the
-thermal source terms. Shortwave uses plane-parallel flux-only solar training
-with absorption optical depth, Rayleigh optical depth, CKDMIP solar irradiance,
-configured `rt.mu_values`, and surface albedo. SW heating loss uses net-flux
-divergence; SW flux loss still compares upwelling and downwelling fluxes to
-avoid cancellation. Formal validation and final scoring still use CKDMIP
-`ckdmip_lw` or `ckdmip_sw`, not py2sess.
+This repo is scoped to training, freezing, exporting, and verifying NLPQ
+methods against CKDMIP data. It is not intended to reproduce every external
+baseline or make runtime-speedup claims. External comparisons, such as RRTMG,
+should be handled in downstream analysis from the saved CKDMIP-format outputs.
+
+The `det` and `rt-aware` paths support longwave and shortwave. `det` is regular
+native-index binning. `rt-aware` trains a frozen assignment with py2sess
+`forward_flux` as the differentiable flux/heating teacher when
+`rt.train_teacher: py2sess`. Longwave uses the thermal source terms. Shortwave
+uses plane-parallel flux-only solar training with absorption optical depth,
+Rayleigh optical depth, CKDMIP solar irradiance, configured `rt.mu_values`, and
+surface albedo. SW heating loss uses net-flux divergence; SW flux loss still
+compares upwelling and downwelling fluxes to avoid cancellation. Formal
+validation and final scoring still use CKDMIP `ckdmip_lw` or `ckdmip_sw`, not
+py2sess.
+
+The current `rt-aware` method is assignment-only. `rt-aware-nn` is available
+for manual YAML runs when species-level CKDMIP optical depths are present. It
+uses the same frozen assignment path, then applies a frozen Q-space neural
+overlap residual to export NN-corrected optical depth.
 
 ## Configure
 
@@ -53,6 +64,16 @@ For a shortwave deterministic-only run, start from:
 
 ```bash
 cp subprojects/ckdmip_nlpq_suite/configs/example_sw_det.yaml run_sw_band02.yaml
+```
+
+To include the neural optical-depth residual in a manual run, edit the copied
+YAML:
+
+```yaml
+nlpq:
+  methods: [det, rt-aware, rt-aware-nn]
+training:
+  nn_steps: 200
 ```
 
 Set these paths in the YAML:
@@ -174,3 +195,14 @@ loads the frozen final model and writes test vertical outputs from Evaluation-2.
 - Formal compressed evaluation requires official CKDMIP spectra, flux truth,
   CKDMIP executables, and the domain-specific source terms required by CKDMIP
   CKD mode.
+- At finite Q, `compress_tau` preserves the native-weighted single-layer
+  transmittance inside each pseudo-line cluster. It does not, by construction,
+  conserve column transmittance, TOA flux, surface flux, or heating rate.
+- The current `rt-aware` closure learns only the hard native-to-Q assignment.
+  NN optical-depth residuals are in the separate `rt-aware-nn` method.
+- `rt-aware-nn` requires species-level `species_tau_native`; official CKDMIP
+  spectra loading provides this, and custom NPZ batches must include it.
+- The current compressed model is a frozen assignment applied to native optical
+  depths; inference still requires CKDMIP/LBL spectra.
+- py2sess training uses a hydrostatic pressure-temperature height grid for the
+  geometry argument. Final scoring still uses the CKDMIP executable.
