@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ckdmip-nlpq
 #SBATCH --time=48:00:00
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --output=%x-%j.out
 

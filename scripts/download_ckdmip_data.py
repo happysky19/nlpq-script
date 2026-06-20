@@ -22,12 +22,20 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--estimate-size", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard-index must be in [0, num-shards)")
 
     config = load_run_config(args.config)
     for band in config.bands:
         paths = build_output_paths(config, band)
         items = build_download_plan(config, band)
+        if args.num_shards > 1:
+            items = items[args.shard_index :: args.num_shards]
         if args.estimate_size:
             items = estimate_download_sizes(items)
         plan_path = paths.run_dir / "download_plan.csv"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import csv
 import re
 import shutil
@@ -92,6 +93,17 @@ class CKDMIPNativeBatch:
     incoming_flux_native: np.ndarray | None = None
 
 
+@dataclass(frozen=True)
+class SpectrumBlockData:
+    gas: str
+    tag: str
+    block: str
+    wavenumber: np.ndarray
+    tau_by_profile: dict[int, np.ndarray]
+    pressure_by_profile: dict[int, np.ndarray]
+    temperature_by_profile: dict[int, np.ndarray]
+
+
 def profile_blocks(config: RunConfig) -> list[str]:
     blocks = config.raw.get("run", {}).get("profile_blocks", list(DEFAULT_PROFILE_BLOCKS))
     return [str(block) for block in blocks]
@@ -119,6 +131,8 @@ def spectrum_filename(domain: str, dataset: str, gas: str, tag: str, block: str)
 
 
 def flux_filename(domain: str, dataset: str, scenario: str) -> str:
+    if domain == "lw":
+        return f"ckdmip_{dataset}_{domain}_fluxes-4angle_{scenario}.h5"
     return f"ckdmip_{dataset}_{domain}_fluxes_{scenario}.h5"
 
 
@@ -136,6 +150,22 @@ def flux_path(config: RunConfig, domain: str, dataset: str, scenario: str) -> Pa
     return config.data_root / "raw" / "ckdmip" / f"{domain}_fluxes" / dataset / flux_filename(
         domain, dataset, scenario
     )
+
+
+def resolve_flux_path(config: RunConfig, domain: str, dataset: str, scenario: str) -> Path:
+    path = flux_path(config, domain, dataset, scenario)
+    if path.exists():
+        return path
+    if domain == "lw":
+        alt_name = (
+            f"ckdmip_{dataset}_{domain}_fluxes_{scenario}.h5"
+            if "-4angle" in path.name
+            else f"ckdmip_{dataset}_{domain}_fluxes-4angle_{scenario}.h5"
+        )
+        alt = path.with_name(alt_name)
+        if alt.exists():
+            return alt
+    return path
 
 
 def ssi_path(config: RunConfig, dataset: str) -> Path:
@@ -165,7 +195,7 @@ def build_download_plan(config: RunConfig, band: int) -> list[DownloadItem]:
                 )
             )
         for scenario in scenarios(config):
-            flux_dest = flux_path(config, domain, dataset, scenario)
+            flux_dest = resolve_flux_path(config, domain, dataset, scenario)
             items.append(
                 DownloadItem(
                     kind="flux",
@@ -355,6 +385,11 @@ def load_native_batch_from_ckdmip(
     if not profiles:
         raise ValueError("profile selection is empty")
 
+    training_config = config.raw.get("training", {})
+    load_workers = int(training_config.get("load_workers", 1))
+    load_dtype_name = str(training_config.get("load_dtype", training_config.get("dtype", "float64")))
+    _numpy_load_dtype(load_dtype_name)
+
     tau_parts: list[np.ndarray] = []
     species_names: list[str] = []
     rayleigh_parts: list[np.ndarray] = []
@@ -362,34 +397,43 @@ def load_native_batch_from_ckdmip(
     temperature_by_profile: dict[int, np.ndarray] = {}
     selected_wavenumber: np.ndarray | None = None
 
-    for gas, tag in species_for_domain(config):
-        gas_tau_by_profile: dict[int, np.ndarray] = {}
-        for block in profile_blocks(config):
-            path = spectrum_path(config, config.domain, dataset, gas, tag, block)
-            if not path.exists():
-                raise FileNotFoundError(path)
-            start = block_start_index(block)
-            with h5py.File(path, "r") as handle:
-                wavenumber = np.asarray(handle["wavenumber"], dtype=np.float64)
-                mask = band_mask(config.domain, int(band), wavenumber)
-                if not np.any(mask):
-                    raise ValueError(f"band {band} selects no wavenumbers in {path}")
-                if selected_wavenumber is None:
-                    selected_wavenumber = wavenumber[mask]
-                elif selected_wavenumber.shape != wavenumber[mask].shape or not np.allclose(
-                    selected_wavenumber, wavenumber[mask]
-                ):
-                    raise ValueError(f"wavenumber grid mismatch in {path}")
-                optical_depth = np.asarray(handle["optical_depth"], dtype=np.float64)
-                pressure = np.asarray(handle["pressure_hl"], dtype=np.float64)
-                temperature = np.asarray(handle["temperature_hl"], dtype=np.float64)
-                for local_idx in range(optical_depth.shape[0]):
-                    profile_id = start + local_idx
-                    if profile_id not in profiles:
-                        continue
-                    gas_tau_by_profile[profile_id] = optical_depth[local_idx, :, mask]
-                    pressure_by_profile.setdefault(profile_id, pressure[local_idx])
-                    temperature_by_profile.setdefault(profile_id, temperature[local_idx])
+    species = species_for_domain(config)
+    blocks = profile_blocks(config)
+    jobs = [
+        (
+            str(spectrum_path(config, config.domain, dataset, gas, tag, block)),
+            config.domain,
+            int(band),
+            gas,
+            tag,
+            block,
+            block_start_index(block),
+            tuple(profiles),
+            load_dtype_name,
+        )
+        for gas, tag in species
+        for block in blocks
+    ]
+    if load_workers > 1 and len(jobs) > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=load_workers) as pool:
+            block_results = list(pool.map(_read_spectrum_block, jobs))
+    else:
+        block_results = [_read_spectrum_block(job) for job in jobs]
+
+    gas_profile_tau: dict[tuple[str, str], dict[int, np.ndarray]] = {(gas, tag): {} for gas, tag in species}
+    for result in block_results:
+        if selected_wavenumber is None:
+            selected_wavenumber = result.wavenumber
+        elif selected_wavenumber.shape != result.wavenumber.shape or not np.allclose(selected_wavenumber, result.wavenumber):
+            raise ValueError(f"wavenumber grid mismatch in {result.gas}:{result.tag}:{result.block}")
+        gas_profile_tau[(result.gas, result.tag)].update(result.tau_by_profile)
+        for profile_id, pressure in result.pressure_by_profile.items():
+            pressure_by_profile.setdefault(profile_id, pressure)
+        for profile_id, temperature in result.temperature_by_profile.items():
+            temperature_by_profile.setdefault(profile_id, temperature)
+
+    for gas, tag in species:
+        gas_tau_by_profile = gas_profile_tau[(gas, tag)]
         if sorted(gas_tau_by_profile) != profiles:
             missing = sorted(set(profiles) - set(gas_tau_by_profile))
             raise FileNotFoundError(f"missing profiles for {gas}: {missing}")
@@ -462,6 +506,61 @@ def load_incoming_flux(
         if incoming.shape[-1] != selected_wavenumber.size:
             raise ValueError(f"SSI grid in {path} does not match selected spectra")
         return incoming
+
+
+def _read_spectrum_block(job: tuple[str, str, int, str, str, str, int, tuple[int, ...], str]) -> SpectrumBlockData:
+    path_text, domain, band, gas, tag, block, start, profiles, dtype_name = job
+    path = Path(path_text)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    dtype = _numpy_load_dtype(dtype_name)
+    profile_set = set(int(profile) for profile in profiles)
+    tau_by_profile: dict[int, np.ndarray] = {}
+    pressure_by_profile: dict[int, np.ndarray] = {}
+    temperature_by_profile: dict[int, np.ndarray] = {}
+    with h5py.File(path, "r") as handle:
+        wavenumber_all = np.asarray(handle["wavenumber"], dtype=np.float64)
+        mask = band_mask(domain, int(band), wavenumber_all)
+        if not np.any(mask):
+            raise ValueError(f"band {band} selects no wavenumbers in {path}")
+        selection = _contiguous_selection(mask)
+        wavenumber = np.asarray(wavenumber_all[selection], dtype=np.float64)
+        optical_depth = handle["optical_depth"]
+        pressure = handle["pressure_hl"]
+        temperature = handle["temperature_hl"]
+        for local_idx in range(optical_depth.shape[0]):
+            profile_id = start + local_idx
+            if profile_id not in profile_set:
+                continue
+            tau_by_profile[profile_id] = np.asarray(optical_depth[local_idx, :, selection], dtype=dtype)
+            pressure_by_profile[profile_id] = np.asarray(pressure[local_idx], dtype=dtype)
+            temperature_by_profile[profile_id] = np.asarray(temperature[local_idx], dtype=dtype)
+    return SpectrumBlockData(
+        gas=gas,
+        tag=tag,
+        block=block,
+        wavenumber=wavenumber,
+        tau_by_profile=tau_by_profile,
+        pressure_by_profile=pressure_by_profile,
+        temperature_by_profile=temperature_by_profile,
+    )
+
+
+def _contiguous_selection(mask: np.ndarray) -> slice | np.ndarray:
+    indices = np.flatnonzero(mask)
+    if indices.size == 0:
+        return mask
+    if int(indices[-1] - indices[0] + 1) == int(indices.size):
+        return slice(int(indices[0]), int(indices[-1]) + 1)
+    return mask
+
+
+def _numpy_load_dtype(name: str) -> type[np.floating[Any]]:
+    if name == "float32":
+        return np.float32
+    if name == "float64":
+        return np.float64
+    raise ValueError("training.load_dtype must be float32 or float64")
 
 
 def species_scale_for_scenario(gas: str, scenario: str) -> float:

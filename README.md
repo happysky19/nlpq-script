@@ -10,7 +10,7 @@ tree.
 Create a Python environment and install the local requirements:
 
 ```bash
-python -m pip install -r subprojects/ckdmip_nlpq_suite/requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 Install the py2sess version that includes `TwoStreamEss.forward_flux` when
@@ -51,19 +51,19 @@ overlap residual to export NN-corrected optical depth.
 Copy and edit the longwave `det + rt-aware` example:
 
 ```bash
-cp subprojects/ckdmip_nlpq_suite/configs/example.yaml run_lw_band04.yaml
+cp configs/example.yaml run_lw_band04.yaml
 ```
 
 For a shortwave `det + rt-aware` run, start from:
 
 ```bash
-cp subprojects/ckdmip_nlpq_suite/configs/example_sw.yaml run_sw_band02.yaml
+cp configs/example_sw.yaml run_sw_band02.yaml
 ```
 
 For a shortwave deterministic-only run, start from:
 
 ```bash
-cp subprojects/ckdmip_nlpq_suite/configs/example_sw_det.yaml run_sw_band02.yaml
+cp configs/example_sw_det.yaml run_sw_band02.yaml
 ```
 
 To include the neural optical-depth residual in a manual run, edit the copied
@@ -86,6 +86,10 @@ Set these paths in the YAML:
 The example configs use repo-local ignored directories so dry-run commands are
 safe to run immediately. For real HPC runs, change these paths to shared
 scratch/project storage before downloading data or launching training.
+
+For large CKDMIP bands, keep `training.load_dtype: float32`, set
+`training.load_workers` near the number of allocated CPU cores, and keep
+`training.py2sess_max_rows` finite to avoid native-reference RT memory spikes.
 
 Use one CKDMIP scenario per YAML file. The loader applies the standard CKDMIP
 trace-gas scaling for scenarios such as `present`, `preindustrial`, `future`,
@@ -113,7 +117,7 @@ profiles and Evaluation-2 is used only once for final testing.
 Preflight:
 
 ```bash
-python subprojects/ckdmip_nlpq_suite/scripts/run_ckdmip_nlpq.py \
+python scripts/run_ckdmip_nlpq.py \
   --config run_lw_band04.yaml \
   --stage preflight
 ```
@@ -121,17 +125,19 @@ python subprojects/ckdmip_nlpq_suite/scripts/run_ckdmip_nlpq.py \
 Plan downloads without writing raw data:
 
 ```bash
-python subprojects/ckdmip_nlpq_suite/scripts/download_ckdmip_data.py \
+python scripts/download_ckdmip_data.py \
   --config run_lw_band04.yaml \
   --dry-run
 ```
 
 Add `--estimate-size` to query remote file sizes while writing the same plan.
+For parallel downloads, launch disjoint shards with `--num-shards N` and
+`--shard-index i`.
 
 Run the full workflow:
 
 ```bash
-python subprojects/ckdmip_nlpq_suite/scripts/run_ckdmip_nlpq.py \
+python scripts/run_ckdmip_nlpq.py \
   --config run_lw_band04.yaml \
   --stage all
 ```
@@ -139,8 +145,8 @@ python subprojects/ckdmip_nlpq_suite/scripts/run_ckdmip_nlpq.py \
 On Slurm:
 
 ```bash
-sbatch subprojects/ckdmip_nlpq_suite/slurm/download_band.sbatch /absolute/path/to/run_lw_band04.yaml
-sbatch subprojects/ckdmip_nlpq_suite/slurm/run_band_all.sbatch /absolute/path/to/run_lw_band04.yaml
+sbatch slurm/download_band.sbatch /absolute/path/to/run_lw_band04.yaml
+sbatch slurm/run_band_all.sbatch /absolute/path/to/run_lw_band04.yaml
 ```
 
 ## Outputs
@@ -206,3 +212,5 @@ loads the frozen final model and writes test vertical outputs from Evaluation-2.
   depths; inference still requires CKDMIP/LBL spectra.
 - py2sess training uses a hydrostatic pressure-temperature height grid for the
   geometry argument. Final scoring still uses the CKDMIP executable.
+- LW truth flux files prefer CKDMIP `fluxes-4angle` when available, matching
+  the CKDMIP RT namelist used by this workflow.

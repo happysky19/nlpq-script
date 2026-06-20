@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +92,8 @@ def train_rt_aware_assignment(
     entropy_weight = float(options.get("entropy_loss_weight", 0.0005))
     temperature = float(options.get("assignment_temperature", 1.0))
     log_every = max(1, int(options.get("log_every_steps", max(1, steps // 5))))
+    max_rt_rows = _max_py2sess_rows(options)
+    use_checkpoint = _use_gradient_checkpointing(options)
 
     layer_mask = _layer_pressure_mask(
         batch.pressure_hl,
@@ -118,6 +121,7 @@ def train_rt_aware_assignment(
             py2sess_repo=py2sess_repo,
             dtype_name=str(options.get("dtype", "float32")),
             torch=torch,
+            max_rows=max_rt_rows,
         )
         flux_scale = torch.sqrt(
             torch.mean(torch.square(torch.cat([ref_up[level_mask_t], ref_down[level_mask_t]])))
@@ -141,18 +145,15 @@ def train_rt_aware_assignment(
     for step in range(steps):
         optimizer.zero_grad(set_to_none=True)
         probabilities = torch.softmax(logits / max(temperature, EPS), dim=1)
-        weights_q, tau_q, surface_q = compress_soft(
+        weights_q, tau_q, surface_q = _checkpoint_if_enabled(
+            use_checkpoint,
+            lambda p: compress_soft(p, alpha, tau, surface_source, torch=torch),
             probabilities,
-            alpha,
-            tau,
-            surface_source,
-            torch=torch,
         )
-        source_level_q = compress_soft_level_source(
+        source_level_q = _checkpoint_if_enabled(
+            use_checkpoint,
+            lambda p: compress_soft_level_source(p, alpha, source_level, torch=torch),
             probabilities,
-            alpha,
-            source_level,
-            torch=torch,
         )
         up, down, heat = py2sess_forward_flux_rt(
             tau_q,
@@ -166,12 +167,17 @@ def train_rt_aware_assignment(
             py2sess_repo=py2sess_repo,
             dtype_name=str(options.get("dtype", "float32")),
             torch=torch,
+            max_rows=max_rt_rows,
         )
         flux_err = torch.cat([(up - ref_up)[level_mask_t], (down - ref_down)[level_mask_t]])
         heat_err = (heat - ref_heat)[layer_mask_t]
         flux_loss = torch.mean(torch.square(flux_err / flux_scale))
         heat_loss = torch.mean(torch.square(heat_err / heat_scale))
-        feature_loss = feature_reconstruction_loss(probabilities, alpha, tau, source_layer, torch=torch)
+        feature_loss = _checkpoint_if_enabled(
+            use_checkpoint,
+            lambda p: feature_reconstruction_loss(p, alpha, tau, source_layer, torch=torch),
+            probabilities,
+        )
         target_weight = torch.full_like(weights_q, 1.0 / float(q_value))
         usage_loss = torch.mean(torch.square((weights_q - target_weight) / target_weight.clamp_min(EPS)))
         entropy = -torch.sum(probabilities * torch.log(probabilities.clamp_min(EPS)), dim=1).mean()
@@ -296,6 +302,8 @@ def train_sw_rt_aware_assignment(
     entropy_weight = float(options.get("entropy_loss_weight", 0.0005))
     temperature = float(options.get("assignment_temperature", 1.0))
     log_every = max(1, int(options.get("log_every_steps", max(1, steps // 5))))
+    max_rt_rows = _max_py2sess_rows(options)
+    use_checkpoint = _use_gradient_checkpointing(options)
 
     layer_mask = _layer_pressure_mask(
         batch.pressure_hl,
@@ -326,6 +334,7 @@ def train_sw_rt_aware_assignment(
             py2sess_repo=py2sess_repo,
             dtype_name=str(options.get("dtype", "float32")),
             torch=torch,
+            max_rows=max_rt_rows,
         )
         level_mask_g = level_mask_t.expand(ref_up.shape[0], -1, -1)
         layer_mask_g = layer_mask_t.expand(ref_heat.shape[0], -1, -1)
@@ -351,13 +360,10 @@ def train_sw_rt_aware_assignment(
     for step in range(steps):
         optimizer.zero_grad(set_to_none=True)
         probabilities = torch.softmax(logits / max(temperature, EPS), dim=1)
-        weights_q, tau_abs_q, rayleigh_q, incoming_q = compress_soft_sw(
+        weights_q, tau_abs_q, rayleigh_q, incoming_q = _checkpoint_if_enabled(
+            use_checkpoint,
+            lambda p: compress_soft_sw(p, alpha, tau_abs, rayleigh, incoming, torch=torch),
             probabilities,
-            alpha,
-            tau_abs,
-            rayleigh,
-            incoming,
-            torch=torch,
         )
         up, down, heat = py2sess_forward_flux_sw(
             tau_abs_q,
@@ -374,6 +380,7 @@ def train_sw_rt_aware_assignment(
             py2sess_repo=py2sess_repo,
             dtype_name=str(options.get("dtype", "float32")),
             torch=torch,
+            max_rows=max_rt_rows,
         )
         level_mask_g = level_mask_t.expand(up.shape[0], -1, -1)
         layer_mask_g = layer_mask_t.expand(heat.shape[0], -1, -1)
@@ -381,7 +388,11 @@ def train_sw_rt_aware_assignment(
         heat_err = (heat - ref_heat)[layer_mask_g]
         flux_loss = torch.mean(torch.square(flux_err / flux_scale))
         heat_loss = torch.mean(torch.square(heat_err / heat_scale))
-        feature_loss = sw_feature_reconstruction_loss(probabilities, alpha, tau_abs, rayleigh, incoming, torch=torch)
+        feature_loss = _checkpoint_if_enabled(
+            use_checkpoint,
+            lambda p: sw_feature_reconstruction_loss(p, alpha, tau_abs, rayleigh, incoming, torch=torch),
+            probabilities,
+        )
         target_weight = torch.full_like(weights_q, 1.0 / float(q_value))
         usage_loss = torch.mean(torch.square((weights_q - target_weight) / target_weight.clamp_min(EPS)))
         entropy = -torch.sum(probabilities * torch.log(probabilities.clamp_min(EPS)), dim=1).mean()
@@ -510,6 +521,7 @@ def py2sess_forward_flux_rt(
     py2sess_repo: Path | None,
     dtype_name: str,
     torch: Any,
+    max_rows: int | None = None,
 ) -> tuple[Any, Any, Any]:
     check_py2sess_forward_flux_available(py2sess_repo)
     from py2sess import TwoStreamEss, TwoStreamEssOptions
@@ -531,33 +543,38 @@ def py2sess_forward_flux_rt(
             torch_enable_grad=True,
         )
     )
-    tau_rows = tau_blq.permute(0, 2, 1).reshape(batch * q_count, layers).contiguous().clamp_min(EPS)
-    source_rows = source_level_bkq.permute(0, 2, 1).reshape(batch * q_count, layers + 1).contiguous()
-    surface_rows = surface_source_bq.reshape(batch * q_count).contiguous()
-    zeros = torch.zeros_like(tau_rows)
-    result = solver.forward_flux(
-        tau=tau_rows,
-        ssa=zeros,
-        g=zeros,
-        z=_hydrostatic_height_grid(pressure_hl_pa, temperature_hl_k),
-        angles=[0.0],
-        stream=1.0 / math.sqrt(3.0),
-        planck=source_rows,
-        surface_planck=surface_rows,
-        emissivity=torch.ones(batch * q_count, dtype=tau_blq.dtype, device=tau_blq.device),
-        albedo=torch.zeros(batch * q_count, dtype=tau_blq.dtype, device=tau_blq.device),
-        include_fo=True,
-        return_net=True,
-    )
-    up_rows = result.flux_up
-    down_rows = result.flux_down
-    if up_rows.ndim == 3:
-        up_rows = up_rows[..., 0, :]
-        down_rows = down_rows[..., 0, :]
-    up_bqk = up_rows.reshape(batch, q_count, layers + 1)
-    down_bqk = down_rows.reshape(batch, q_count, layers + 1)
-    up_flux = torch.einsum("q,bqk->bk", weights_q, up_bqk)
-    down_flux = torch.einsum("q,bqk->bk", weights_q, down_bqk)
+    height_grid = _hydrostatic_height_grid(pressure_hl_pa, temperature_hl_k)
+    up_flux = tau_blq.new_zeros((batch, layers + 1))
+    down_flux = tau_blq.new_zeros((batch, layers + 1))
+    for q_slice in _q_slices(batch, q_count, _resolve_max_rows(max_rows)):
+        q_len = int(q_slice.stop - q_slice.start)
+        tau_rows = tau_blq[:, :, q_slice].permute(0, 2, 1).reshape(batch * q_len, layers).contiguous().clamp_min(EPS)
+        source_rows = source_level_bkq[:, :, q_slice].permute(0, 2, 1).reshape(batch * q_len, layers + 1).contiguous()
+        surface_rows = surface_source_bq[:, q_slice].reshape(batch * q_len).contiguous()
+        zeros = torch.zeros_like(tau_rows)
+        result = solver.forward_flux(
+            tau=tau_rows,
+            ssa=zeros,
+            g=zeros,
+            z=height_grid,
+            angles=[0.0],
+            stream=1.0 / math.sqrt(3.0),
+            planck=source_rows,
+            surface_planck=surface_rows,
+            emissivity=torch.ones(batch * q_len, dtype=tau_blq.dtype, device=tau_blq.device),
+            albedo=torch.zeros(batch * q_len, dtype=tau_blq.dtype, device=tau_blq.device),
+            include_fo=True,
+            return_net=True,
+        )
+        up_rows = result.flux_up
+        down_rows = result.flux_down
+        if up_rows.ndim == 3:
+            up_rows = up_rows[..., 0, :]
+            down_rows = down_rows[..., 0, :]
+        up_bqk = up_rows.reshape(batch, q_len, layers + 1)
+        down_bqk = down_rows.reshape(batch, q_len, layers + 1)
+        up_flux = up_flux + torch.einsum("q,bqk->bk", weights_q[q_slice], up_bqk)
+        down_flux = down_flux + torch.einsum("q,bqk->bk", weights_q[q_slice], down_bqk)
     net_flux = up_flux - down_flux
     dp = torch.diff(pressure_hl_pa, dim=1).clamp_min(EPS)
     heating = (net_flux[:, 1:] - net_flux[:, :-1]) * GRAVITY_M_S2 * SECONDS_PER_DAY / float(cp_air_j_kg_k) / dp
@@ -580,6 +597,7 @@ def py2sess_forward_flux_sw(
     py2sess_repo: Path | None,
     dtype_name: str,
     torch: Any,
+    max_rows: int | None = None,
 ) -> tuple[Any, Any, Any]:
     check_py2sess_forward_flux_available(py2sess_repo)
     from py2sess import TwoStreamEss, TwoStreamEssOptions
@@ -611,12 +629,6 @@ def py2sess_forward_flux_sw(
             torch_enable_grad=True,
         )
     )
-    row_count = batch * q_count
-    tau_rows = tau_total.permute(0, 2, 1).reshape(row_count, layers).contiguous()
-    ssa_rows = ssa_blq.permute(0, 2, 1).reshape(row_count, layers).contiguous()
-    g_rows = g_blq.permute(0, 2, 1).reshape(row_count, layers).contiguous()
-    incoming_rows = incoming_bq.reshape(row_count).contiguous()
-    albedo_rows = torch.full((row_count,), float(surf_albedo), dtype=tau_abs_blq.dtype, device=tau_abs_blq.device)
     height_grid = _hydrostatic_height_grid(pressure_hl_pa, temperature_hl_k)
     up_by_mu = []
     down_by_mu = []
@@ -624,27 +636,35 @@ def py2sess_forward_flux_sw(
     for mu0 in mu_values:
         mu0_clamped = max(min(float(mu0), 1.0), 1.0e-6)
         sza = math.degrees(math.acos(mu0_clamped))
-        result = solver.forward_flux(
-            tau=tau_rows,
-            ssa=ssa_rows,
-            g=g_rows,
-            z=height_grid,
-            angles=[sza, 0.0, 0.0],
-            stream=stream,
-            fbeam=incoming_rows,
-            albedo=albedo_rows,
-            include_fo=include_fo,
-            return_net=True,
-        )
-        up_rows = _flux_rows(result.flux_up, row_count)
-        down_rows = _flux_rows(result.flux_down, row_count)
-        net_rows = _net_flux_rows(result, up_rows, down_rows, row_count)
-        up_bqk = up_rows.reshape(batch, q_count, layers + 1)
-        down_bqk = down_rows.reshape(batch, q_count, layers + 1)
-        net_bqk = net_rows.reshape(batch, q_count, layers + 1)
-        up_flux = up_bqk.sum(dim=1)
-        down_flux = down_bqk.sum(dim=1)
-        net_flux = net_bqk.sum(dim=1)
+        up_flux = tau_abs_blq.new_zeros((batch, layers + 1))
+        down_flux = tau_abs_blq.new_zeros((batch, layers + 1))
+        net_flux = tau_abs_blq.new_zeros((batch, layers + 1))
+        for q_slice in _q_slices(batch, q_count, _resolve_max_rows(max_rows)):
+            q_len = int(q_slice.stop - q_slice.start)
+            row_count = batch * q_len
+            tau_rows = tau_total[:, :, q_slice].permute(0, 2, 1).reshape(row_count, layers).contiguous()
+            ssa_rows = ssa_blq[:, :, q_slice].permute(0, 2, 1).reshape(row_count, layers).contiguous()
+            g_rows = g_blq[:, :, q_slice].permute(0, 2, 1).reshape(row_count, layers).contiguous()
+            incoming_rows = incoming_bq[:, q_slice].reshape(row_count).contiguous()
+            albedo_rows = torch.full((row_count,), float(surf_albedo), dtype=tau_abs_blq.dtype, device=tau_abs_blq.device)
+            result = solver.forward_flux(
+                tau=tau_rows,
+                ssa=ssa_rows,
+                g=g_rows,
+                z=height_grid,
+                angles=[sza, 0.0, 0.0],
+                stream=stream,
+                fbeam=incoming_rows,
+                albedo=albedo_rows,
+                include_fo=include_fo,
+                return_net=True,
+            )
+            up_rows = _flux_rows(result.flux_up, row_count)
+            down_rows = _flux_rows(result.flux_down, row_count)
+            net_rows = _net_flux_rows(result, up_rows, down_rows, row_count)
+            up_flux = up_flux + up_rows.reshape(batch, q_len, layers + 1).sum(dim=1)
+            down_flux = down_flux + down_rows.reshape(batch, q_len, layers + 1).sum(dim=1)
+            net_flux = net_flux + net_rows.reshape(batch, q_len, layers + 1).sum(dim=1)
         dp = torch.diff(pressure_hl_pa, dim=1).clamp_min(EPS)
         heating = (net_flux[:, 1:] - net_flux[:, :-1]) * GRAVITY_M_S2 * SECONDS_PER_DAY / float(cp_air_j_kg_k) / dp
         up_by_mu.append(up_flux)
@@ -775,6 +795,38 @@ def _to_numpy(value: Any) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach().cpu().numpy()
     return np.asarray(value, dtype=np.float64)
+
+
+def _max_py2sess_rows(options: dict[str, Any]) -> int:
+    value = options.get("py2sess_max_rows")
+    if value is None:
+        value = os.environ.get("_PY2SESS_MAX_ROWS", os.environ.get("PY2SESS_MAX_ROWS", "131072"))
+    return int(value)
+
+
+def _resolve_max_rows(max_rows: int | None) -> int:
+    if max_rows is None:
+        return _max_py2sess_rows({})
+    if int(max_rows) <= 0:
+        return 2**62
+    return int(max_rows)
+
+
+def _q_slices(batch_count: int, q_count: int, max_rows: int) -> list[slice]:
+    q_per_chunk = max(1, int(max_rows) // max(1, int(batch_count)))
+    return [slice(start, min(q_count, start + q_per_chunk)) for start in range(0, q_count, q_per_chunk)]
+
+
+def _use_gradient_checkpointing(options: dict[str, Any]) -> bool:
+    return bool(options.get("gradient_checkpointing", options.get("use_gradient_checkpointing", True)))
+
+
+def _checkpoint_if_enabled(enabled: bool, function: Any, *args: Any) -> Any:
+    if not enabled:
+        return function(*args)
+    from torch.utils.checkpoint import checkpoint
+
+    return checkpoint(function, *args, use_reentrant=False)
 
 
 def _flux_rows(value: Any, row_count: int) -> Any:

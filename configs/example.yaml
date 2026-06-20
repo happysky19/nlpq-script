@@ -1,8 +1,8 @@
 paths:
-  data_root: subprojects/ckdmip_nlpq_suite/data
-  run_root: subprojects/ckdmip_nlpq_suite/runs
-  ckdmip_bin: subprojects/ckdmip_nlpq_suite/external/ckdmip/bin
-  py2sess_repo: subprojects/ckdmip_nlpq_suite/external/py2sess
+  data_root: data
+  run_root: runs
+  ckdmip_bin: external/ckdmip/bin
+  py2sess_repo: external/py2sess
 
 run:
   domain: lw
@@ -32,6 +32,10 @@ training:
   steps: 220
   lr: 0.05
   dtype: float32
+  load_dtype: float32
+  load_workers: 16
+  py2sess_max_rows: 131072
+  gradient_checkpointing: true
   device: cuda
   checkpoint_every_steps: 25
 

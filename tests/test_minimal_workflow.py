@@ -15,9 +15,17 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
 from ckdmip_nlpq.config import build_output_paths, load_run_config, parse_profile_spec  # noqa: E402
-from ckdmip_nlpq.data import build_download_plan, species_scale_for_scenario, write_download_plan  # noqa: E402
+from ckdmip_nlpq.data import (  # noqa: E402
+    build_download_plan,
+    load_native_batch_from_ckdmip,
+    species_scale_for_scenario,
+    spectrum_path,
+    ssi_path,
+    write_download_plan,
+)
 from ckdmip_nlpq.metrics import build_flux_metrics  # noqa: E402
 from ckdmip_nlpq.model import NLPQModel, NativeBatch  # noqa: E402
+from ckdmip_nlpq.rt_aware import py2sess_forward_flux_rt  # noqa: E402
 from ckdmip_nlpq.tuning import rank_candidates, write_selected_settings  # noqa: E402
 from ckdmip_nlpq.workflow import run_stage, write_vertical_outputs  # noqa: E402
 
@@ -56,6 +64,45 @@ class MinimalWorkflowTest(unittest.TestCase):
             self.assertIn("ckdmip_evaluation1_sw_fluxes_present.h5", text)
             self.assertIn("ckdmip_evaluation1_sw_spectra_h2o_present_1-10.h5", text)
             self.assertIn("ckdmip_ssi.h5", text)
+
+    def test_parallel_loader_preserves_species_tau(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = load_run_config(write_config(root))
+            cfg.raw["training"]["load_workers"] = 2
+            cfg.raw["training"]["load_dtype"] = "float32"
+            wavenumber = np.linspace(2600.0, 3249.0, 4)
+            pressure = np.tile(np.linspace(100.0, 1000.0, 4), (10, 1))
+            temperature = np.tile(np.linspace(220.0, 290.0, 4), (10, 1))
+            profile = np.arange(10)[:, None, None]
+            layer = np.arange(3)[None, :, None]
+            spectral = np.arange(4)[None, None, :]
+            optical_depth = 0.01 + 0.001 * profile + 0.002 * layer + 0.003 * spectral
+            spectra_file = spectrum_path(cfg, "sw", "evaluation1", "h2o", "present", "1-10")
+            spectra_file.parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(spectra_file, "w") as handle:
+                handle["wavenumber"] = wavenumber
+                handle["optical_depth"] = optical_depth
+                handle["pressure_hl"] = pressure
+                handle["temperature_hl"] = temperature
+            ssi_file = ssi_path(cfg, "evaluation1")
+            ssi_file.parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(ssi_file, "w") as handle:
+                handle["wavenumber"] = wavenumber
+                handle["solar_spectral_irradiance"] = np.linspace(1.0, 2.0, 4)
+
+            batch = load_native_batch_from_ckdmip(
+                cfg,
+                band=2,
+                dataset="evaluation1",
+                profile_spec="0-2",
+                scenario="present",
+            )
+            self.assertEqual(batch.species_names, ("h2o",))
+            self.assertEqual(batch.species_tau_native.shape, (3, 3, 1, 4))
+            np.testing.assert_allclose(batch.tau_native, optical_depth[:3].astype(np.float32))
+            np.testing.assert_allclose(batch.species_tau_native[:, :, 0, :], batch.tau_native)
+            np.testing.assert_allclose(batch.incoming_flux_native, np.linspace(1.0, 2.0, 4))
 
     def test_standard_scenario_scaling(self) -> None:
         self.assertAlmostEqual(species_scale_for_scenario("co2", "future"), 1120.0 / 415.0)
@@ -122,6 +169,49 @@ class MinimalWorkflowTest(unittest.TestCase):
                     },
                     py2sess_repo=repo,
                 )
+
+    def test_py2sess_lw_chunking_matches_unchunked_flux(self) -> None:
+        import torch
+
+        batch = native_batch(profile_count=2, spectral_count=5)
+        tau = torch.tensor(batch.tau_native, dtype=torch.float32)
+        weights = torch.full((5,), 0.2, dtype=torch.float32)
+        source = torch.ones((2, 4, 5), dtype=torch.float32) * 0.1
+        surface = torch.ones((2, 5), dtype=torch.float32) * 0.2
+        pressure = torch.tensor(batch.pressure_hl, dtype=torch.float32)
+        temperature = torch.tensor(batch.temperature_hl, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = write_fake_py2sess_repo(Path(repo_dir))
+            full = py2sess_forward_flux_rt(
+                tau,
+                weights,
+                source,
+                surface,
+                pressure,
+                temperature,
+                streams=2,
+                cp_air_j_kg_k=1004.0,
+                py2sess_repo=repo,
+                dtype_name="float32",
+                torch=torch,
+                max_rows=1000,
+            )
+            chunked = py2sess_forward_flux_rt(
+                tau,
+                weights,
+                source,
+                surface,
+                pressure,
+                temperature,
+                streams=2,
+                cp_air_j_kg_k=1004.0,
+                py2sess_repo=repo,
+                dtype_name="float32",
+                torch=torch,
+                max_rows=4,
+            )
+        for full_value, chunked_value in zip(full, chunked):
+            torch.testing.assert_close(full_value, chunked_value)
 
     def test_sw_rt_aware_model_trains_and_exports_source_terms(self) -> None:
         batch = sw_native_batch(profile_count=3, spectral_count=6)

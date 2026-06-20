@@ -14,10 +14,10 @@ from .data import (
     CKDMIPNativeBatch,
     build_download_plan,
     download_items,
-    flux_path,
     load_native_batch_from_ckdmip,
     load_native_batch_from_npz,
     missing_required_files,
+    resolve_flux_path,
     write_download_plan,
 )
 from .metrics import build_flux_metrics
@@ -161,7 +161,7 @@ def dev_tune(config: RunConfig, *, band: int, dry_run: bool = False) -> None:
             scenario=primary_scenario(config),
             dry_run=False,
         )
-        truth_path = flux_path(config, config.domain, "evaluation1", primary_scenario(config))
+        truth_path = resolve_flux_path(config, config.domain, "evaluation1", primary_scenario(config))
         metric_fields = (
             build_flux_metrics(
                 domain=config.domain,
@@ -268,7 +268,7 @@ def final_train(config: RunConfig, *, band: int, dry_run: bool = False) -> None:
         dry_run=False,
     )
     write_command_manifest(paths.run_dir / "ckdmip_train_commands.json", [train_result])
-    train_truth = flux_path(config, config.domain, "evaluation1", primary_scenario(config))
+    train_truth = resolve_flux_path(config, config.domain, "evaluation1", primary_scenario(config))
     train_metric_fields = (
         build_flux_metrics(
             domain=config.domain,
@@ -555,7 +555,7 @@ def primary_scenario(config: RunConfig) -> str:
 
 
 def flux_path_for_final(config: RunConfig, *, scenario: str) -> Path:
-    return flux_path(config, config.domain, str(config.raw["split"]["final"]["test_dataset"]), scenario)
+    return resolve_flux_path(config, config.domain, str(config.raw["split"]["final"]["test_dataset"]), scenario)
 
 
 def write_vertical_outputs(

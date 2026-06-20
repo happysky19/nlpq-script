@@ -12,7 +12,7 @@ import numpy as np
 from netCDF4 import Dataset
 
 from .config import RunConfig, build_output_paths
-from .data import flux_path
+from .data import resolve_flux_path
 
 
 _cache_root = Path(tempfile.gettempdir()) / "ckdmip-nlpq-cache"
@@ -43,7 +43,7 @@ def plot_band_outputs(config: RunConfig, *, band: int) -> Path:
     if not model_flux.exists():
         raise FileNotFoundError(model_flux)
     scenario = str(config.raw.get("run", {}).get("scenarios", ["present"])[0])
-    truth_flux = flux_path(config, config.domain, str(config.raw["split"]["final"]["test_dataset"]), scenario)
+    truth_flux = resolve_flux_path(config, config.domain, str(config.raw["split"]["final"]["test_dataset"]), scenario)
     test_profiles = parse_profile_spec(str(config.raw["split"]["final"].get("test_profiles", "0-49")))
     model = read_model_flux(model_flux, config.domain)
     if test_profiles:
