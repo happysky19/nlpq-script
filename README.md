@@ -34,14 +34,15 @@ The `det` and `rt-aware` paths support longwave and shortwave. `det` is regular
 native-index binning. `rt-aware` trains a frozen assignment with py2sess
 `forward_flux` as the differentiable flux/heating teacher when
 `rt.train_teacher: py2sess`. Longwave uses the thermal source terms. Shortwave
-uses plane-parallel flux-only solar training with absorption optical depth,
-Rayleigh optical depth, CKDMIP solar irradiance, configured `rt.mu_values`, and
-surface albedo. SW compressed optics default to direct-beam absorption closure
-at `nlpq.sw_tau_mu_ref` and solar-weighted arithmetic Rayleigh closure, so
-training and CKDMIP export use the same source-aware moments. SW heating loss
-uses net-flux divergence; SW flux loss still compares upwelling and downwelling
-fluxes to avoid cancellation. Formal validation and final scoring still use
-CKDMIP `ckdmip_lw` or `ckdmip_sw`, not py2sess.
+uses py2sess solar `forward_flux` with first-order correction enabled by
+default, absorption optical depth, Rayleigh optical depth, CKDMIP solar
+irradiance, configured `rt.mu_values`, and surface albedo. SW compressed optics
+default to direct-beam absorption closure at `nlpq.sw_tau_mu_ref` and
+solar-weighted arithmetic Rayleigh closure, so training and CKDMIP export use
+the same source-aware moments. SW heating loss uses net-flux divergence; SW
+flux loss still compares upwelling and downwelling fluxes to avoid
+cancellation. Formal validation and final scoring still use CKDMIP `ckdmip_lw`
+or `ckdmip_sw`, not py2sess.
 
 The current `rt-aware` method is assignment-only. `rt-aware-nn` is available
 for manual YAML runs when species-level CKDMIP optical depths are present. It
@@ -194,8 +195,9 @@ loads the frozen final model and writes test vertical outputs from Evaluation-2.
 - SW `rt-aware` requires official CKDMIP Rayleigh optical depth and solar
   irradiance unless `rt.allow_zero_rayleigh: true` is explicitly set for a
   diagnostic run.
-- SW `rt-aware` uses py2sess plane-parallel flux-only training; keep
-  `rt.sw_include_fo: false`.
+- SW `rt-aware` uses py2sess solar first-order correction by default. Keep
+  `rt.sw_include_fo: true`, `rt.sw_plane_parallel: false`, and
+  `rt.sw_geometry: pseudo_spherical` unless running a diagnostic ablation.
 - Evaluation-2 must not appear in tuning.
 - Train/validation profile leakage is rejected.
 - Dev tuning exports frozen candidates, runs CKDMIP RT, and ranks on flux and

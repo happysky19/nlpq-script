@@ -316,9 +316,11 @@ def train_sw_rt_aware_assignment(
     streams = int(options.get("streams", options.get("sw_streams", 4)))
     cp_air = float(options.get("cp_air_j_kg_k", 1004.0))
     surf_albedo = float(options.get("surf_albedo", 0.15))
-    include_fo = bool(options.get("include_fo", options.get("sw_include_fo", False)))
-    if include_fo:
-        raise ValueError("SW rt-aware training uses plane-parallel flux-only forward_flux; set sw_include_fo=false")
+    include_fo = bool(options.get("include_fo", options.get("sw_include_fo", True)))
+    plane_parallel = bool(options.get("sw_plane_parallel", options.get("plane_parallel", not include_fo)))
+    geometry = str(options.get("sw_geometry", options.get("geometry", "pseudo_spherical")))
+    if include_fo and plane_parallel:
+        raise ValueError("SW include_fo=True requires sw_plane_parallel=false for py2sess batched solar forward_flux")
     stream_value = float(options.get("stream", 1.0 / math.sqrt(3.0)))
     flux_weight = float(options.get("flux_loss_weight", 1.0))
     heating_weight = float(options.get("heating_loss_weight", 1.0))
@@ -353,6 +355,8 @@ def train_sw_rt_aware_assignment(
             mu_values=mu_values,
             surf_albedo=surf_albedo,
             include_fo=include_fo,
+            plane_parallel=plane_parallel,
+            geometry=geometry,
             stream=stream_value,
             streams=streams,
             cp_air_j_kg_k=cp_air,
@@ -409,6 +413,8 @@ def train_sw_rt_aware_assignment(
             mu_values=mu_values,
             surf_albedo=surf_albedo,
             include_fo=include_fo,
+            plane_parallel=plane_parallel,
+            geometry=geometry,
             stream=stream_value,
             streams=streams,
             cp_air_j_kg_k=cp_air,
@@ -470,6 +476,8 @@ def train_sw_rt_aware_assignment(
         "mu_values": mu_values,
         "surf_albedo": surf_albedo,
         "include_fo": include_fo,
+        "sw_plane_parallel": plane_parallel,
+        "sw_geometry": geometry,
         "sw_tau_mode": sw_tau_mode,
         "sw_rayleigh_mode": sw_rayleigh_mode,
         "sw_tau_mu_ref": sw_tau_mu_ref,
@@ -722,6 +730,8 @@ def py2sess_forward_flux_sw(
     mu_values: list[float],
     surf_albedo: float,
     include_fo: bool,
+    plane_parallel: bool,
+    geometry: str,
     stream: float,
     streams: int,
     cp_air_j_kg_k: float,
@@ -754,7 +764,7 @@ def py2sess_forward_flux_sw(
             upwelling=True,
             downwelling=True,
             delta_scaling=False,
-            plane_parallel=True,
+            plane_parallel=plane_parallel,
             fo_flux_n_mu=int(streams),
             torch_dtype=dtype_name,
             torch_enable_grad=True,
@@ -788,6 +798,7 @@ def py2sess_forward_flux_sw(
                 fbeam=incoming_rows,
                 albedo=albedo_rows,
                 include_fo=include_fo,
+                geometry=geometry,
                 return_net=True,
             )
             up_rows = _flux_rows(result.flux_up, row_count)

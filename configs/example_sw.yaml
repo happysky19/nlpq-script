@@ -61,5 +61,7 @@ rt:
   mu_values: [0.1, 0.3, 0.5, 0.7, 0.9]
   sw_streams: 4
   surf_albedo: 0.15
-  sw_include_fo: false
+  sw_include_fo: true
+  sw_plane_parallel: false
+  sw_geometry: pseudo_spherical
   allow_zero_rayleigh: false
