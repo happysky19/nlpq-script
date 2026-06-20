@@ -62,6 +62,5 @@ rt:
   sw_streams: 4
   surf_albedo: 0.15
   sw_include_fo: true
-  sw_plane_parallel: false
-  sw_geometry: pseudo_spherical
+  sw_plane_parallel: true
   allow_zero_rayleigh: false

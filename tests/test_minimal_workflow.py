@@ -358,8 +358,7 @@ class MinimalWorkflowTest(unittest.TestCase):
                     "mu_values": [0.5],
                     "surf_albedo": 0.1,
                     "include_fo": True,
-                    "sw_plane_parallel": False,
-                    "sw_geometry": "pseudo_spherical",
+                    "sw_plane_parallel": True,
                     "sw_tau_mode": "direct_beam",
                     "sw_tau_mu_ref": 0.5,
                     "sw_rayleigh_mode": "arithmetic",
@@ -380,8 +379,7 @@ class MinimalWorkflowTest(unittest.TestCase):
         self.assertEqual(training_log["teacher_kernel"], "py2sess_forward_flux_sw")
         self.assertEqual(training_log["mu_values"], [0.5])
         self.assertTrue(training_log["include_fo"])
-        self.assertFalse(training_log["sw_plane_parallel"])
-        self.assertEqual(training_log["sw_geometry"], "pseudo_spherical")
+        self.assertTrue(training_log["sw_plane_parallel"])
         self.assertEqual(training_log["sw_tau_mode"], "direct_beam")
         self.assertEqual(training_log["sw_rayleigh_mode"], "arithmetic")
         self.assertEqual(model.metadata["compression_settings"]["sw_tau_mu_ref"], 0.5)
@@ -439,12 +437,12 @@ class MinimalWorkflowTest(unittest.TestCase):
             loaded_compressed = loaded.apply(batch)
             np.testing.assert_allclose(loaded_compressed.tau_q, compressed.tau_q)
 
-    def test_sw_rt_aware_rejects_plane_parallel_fo_training(self) -> None:
+    def test_sw_rt_aware_rejects_non_plane_parallel_fo_training(self) -> None:
         batch = sw_native_batch(profile_count=2, spectral_count=4)
         model = NLPQModel(domain="sw", band=2, method="rt-aware", q_value=2, seed=4)
         with tempfile.TemporaryDirectory() as repo_dir:
             repo = write_fake_py2sess_repo(Path(repo_dir))
-            with self.assertRaisesRegex(ValueError, "requires sw_plane_parallel=false"):
+            with self.assertRaisesRegex(ValueError, "requires sw_plane_parallel=true"):
                 model.fit(
                     batch,
                     training_config={
@@ -454,7 +452,7 @@ class MinimalWorkflowTest(unittest.TestCase):
                         "dtype": "float32",
                         "device": "cpu",
                         "include_fo": True,
-                        "sw_plane_parallel": True,
+                        "sw_plane_parallel": False,
                     },
                     py2sess_repo=repo,
                 )

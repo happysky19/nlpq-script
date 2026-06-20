@@ -512,9 +512,8 @@ def training_options_for_candidate(config: RunConfig, selected: dict[str, Any]) 
         options["surf_albedo"] = float(rt_options.get("surf_albedo", options.get("surf_albedo", 0.15)))
         options["include_fo"] = bool(rt_options.get("sw_include_fo", options.get("include_fo", True)))
         options["sw_plane_parallel"] = bool(
-            rt_options.get("sw_plane_parallel", options.get("sw_plane_parallel", not options["include_fo"]))
+            rt_options.get("sw_plane_parallel", options.get("sw_plane_parallel", True))
         )
-        options["sw_geometry"] = str(rt_options.get("sw_geometry", options.get("sw_geometry", "pseudo_spherical")))
         options["allow_zero_rayleigh"] = bool(
             rt_options.get("allow_zero_rayleigh", options.get("allow_zero_rayleigh", False))
         )
@@ -555,7 +554,6 @@ def training_summary_fields(metadata: dict[str, Any]) -> dict[str, Any]:
         "surf_albedo",
         "include_fo",
         "sw_plane_parallel",
-        "sw_geometry",
         "sw_tau_mode",
         "sw_rayleigh_mode",
         "sw_tau_mu_ref",
