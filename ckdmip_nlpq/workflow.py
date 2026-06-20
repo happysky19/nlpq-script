@@ -92,7 +92,7 @@ def preflight(config: RunConfig, *, band: int, dry_run: bool = False) -> None:
         "run_id": config.run_id,
         "dry_run": dry_run,
         "errors": errors,
-        "required_identity_check": "Q=M identity export and CKDMIP RT smoke must pass before formal evaluation",
+        "identity_check_scope": "Unit-test or small-window identity only; full-band Q=M CKDMIP RT is not required.",
     }
     paths.manifest_path().write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     if errors and not dry_run:
@@ -514,6 +514,16 @@ def training_options_for_candidate(config: RunConfig, selected: dict[str, Any]) 
         options["allow_zero_rayleigh"] = bool(
             rt_options.get("allow_zero_rayleigh", options.get("allow_zero_rayleigh", False))
         )
+        options["sw_tau_mode"] = str(nlpq_options.get("sw_tau_mode", options.get("sw_tau_mode", "direct_beam")))
+        options["sw_tau_mu_ref"] = float(
+            nlpq_options.get(
+                "sw_tau_mu_ref",
+                rt_options.get("sw_tau_mu_ref", options.get("sw_tau_mu_ref", 0.5)),
+            )
+        )
+        options["sw_rayleigh_mode"] = str(
+            nlpq_options.get("sw_rayleigh_mode", options.get("sw_rayleigh_mode", "arithmetic"))
+        )
     return options
 
 
@@ -536,9 +546,13 @@ def training_summary_fields(metadata: dict[str, Any]) -> dict[str, Any]:
         "teacher_heating_loss_final",
         "train_pressure_min_hpa",
         "train_pressure_max_hpa",
+        "lw_source_mode",
         "mu_values",
         "surf_albedo",
         "include_fo",
+        "sw_tau_mode",
+        "sw_rayleigh_mode",
+        "sw_tau_mu_ref",
     ):
         if key in log:
             fields[key] = log[key]

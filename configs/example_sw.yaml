@@ -26,6 +26,9 @@ nlpq:
   q_values: [6, 9, 12, 16]
   train_pressure_min_hpa: 0.001
   train_pressure_max_hpa: 1100.0
+  sw_tau_mode: direct_beam
+  sw_tau_mu_ref: 0.5
+  sw_rayleigh_mode: arithmetic
   seed: 19
 
 training:

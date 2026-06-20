@@ -24,8 +24,18 @@ from ckdmip_nlpq.data import (  # noqa: E402
     write_download_plan,
 )
 from ckdmip_nlpq.metrics import build_flux_metrics  # noqa: E402
-from ckdmip_nlpq.model import NLPQModel, NativeBatch  # noqa: E402
-from ckdmip_nlpq.rt_aware import py2sess_forward_flux_rt  # noqa: E402
+from ckdmip_nlpq.model import (  # noqa: E402
+    NLPQModel,
+    NativeBatch,
+    compress_direct_beam_tau,
+    compress_solar_weighted_mean_tau,
+)
+from ckdmip_nlpq.rt_aware import (  # noqa: E402
+    compress_soft,
+    compress_soft_integrated_source,
+    compress_soft_level_source,
+    py2sess_forward_flux_rt,
+)
 from ckdmip_nlpq.tuning import rank_candidates, write_selected_settings  # noqa: E402
 from ckdmip_nlpq.workflow import run_stage, write_vertical_outputs  # noqa: E402
 
@@ -119,6 +129,58 @@ class MinimalWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "frozen"):
             model.fit(batch)
 
+    def test_sw_direct_beam_tau_closure(self) -> None:
+        batch = sw_native_batch(profile_count=2, spectral_count=4)
+        cluster = np.array([0, 0, 1, 1], dtype=np.int64)
+        mu_ref = 0.5
+        compressed = compress_direct_beam_tau(
+            batch.tau_native,
+            batch.incoming_flux_native,
+            batch.spectral_weight,
+            cluster,
+            2,
+            mu_ref=mu_ref,
+        )
+        expected = np.empty(batch.tau_native.shape[:-1] + (2,), dtype=np.float64)
+        for q in range(2):
+            mask = cluster == q
+            weights = batch.incoming_flux_native[mask]
+            avg_trans = np.sum(np.exp(-batch.tau_native[..., mask] / mu_ref) * weights, axis=-1) / np.sum(weights)
+            expected[..., q] = -mu_ref * np.log(avg_trans)
+        np.testing.assert_allclose(compressed, expected, rtol=1.0e-12, atol=1.0e-12)
+
+    def test_sw_model_uses_configured_source_weighted_closure(self) -> None:
+        batch = sw_native_batch(profile_count=2, spectral_count=4)
+        model = NLPQModel(domain="sw", band=2, method="det", q_value=2, seed=7)
+        model.fit(
+            batch,
+            training_config={
+                "sw_tau_mode": "direct_beam",
+                "sw_tau_mu_ref": 0.5,
+                "sw_rayleigh_mode": "arithmetic",
+            },
+        ).freeze()
+        compressed = model.apply(batch)
+        expected_tau = compress_direct_beam_tau(
+            batch.tau_native,
+            batch.incoming_flux_native,
+            batch.spectral_weight,
+            model.cluster_id,
+            2,
+            mu_ref=0.5,
+        )
+        expected_rayleigh = compress_solar_weighted_mean_tau(
+            batch.rayleigh_tau_native,
+            batch.incoming_flux_native,
+            batch.spectral_weight,
+            model.cluster_id,
+            2,
+        )
+        np.testing.assert_allclose(compressed.tau_q, expected_tau)
+        np.testing.assert_allclose(compressed.rayleigh_tau_q, expected_rayleigh)
+        self.assertEqual(model.metadata["compression_settings"]["sw_tau_mode"], "direct_beam")
+        self.assertEqual(model.metadata["compression_settings"]["sw_rayleigh_mode"], "arithmetic")
+
     def test_lw_rt_aware_model_trains_and_freezes(self) -> None:
         batch = native_batch(profile_count=3, spectral_count=6)
         model = NLPQModel(domain="lw", band=4, method="rt-aware", q_value=3, seed=2)
@@ -151,6 +213,72 @@ class MinimalWorkflowTest(unittest.TestCase):
             model.save(path)
             loaded = NLPQModel.load(path)
             self.assertEqual(loaded.metadata["training_log"]["rt_aware_training"], "optimized")
+
+    def test_lw_integrated_source_matches_weighted_mean_teacher_flux(self) -> None:
+        import torch
+
+        batch = native_batch(profile_count=2, spectral_count=5)
+        alpha = torch.tensor(batch.spectral_weight, dtype=torch.float32)
+        tau = torch.tensor(batch.tau_native, dtype=torch.float32)
+        pressure = torch.tensor(batch.pressure_hl, dtype=torch.float32)
+        temperature = torch.tensor(batch.temperature_hl, dtype=torch.float32)
+        source = torch.tensor(0.2 + 0.01 * np.arange(2 * 4 * 5).reshape(2, 4, 5), dtype=torch.float32)
+        surface = source[:, -1, :]
+        probabilities = torch.tensor(
+            [
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+
+        weights_mean, tau_mean, surface_mean = compress_soft(probabilities, alpha, tau, surface, torch=torch)
+        source_mean = compress_soft_level_source(probabilities, alpha, source, torch=torch)
+        weights_int, tau_int, source_int, surface_int = compress_soft_integrated_source(
+            probabilities,
+            alpha,
+            tau,
+            source,
+            surface,
+            torch=torch,
+        )
+
+        np.testing.assert_allclose(tau_int.detach().numpy(), tau_mean.detach().numpy(), rtol=1.0e-6)
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = write_fake_py2sess_repo(Path(repo_dir))
+            up_mean, down_mean, heat_mean = py2sess_forward_flux_rt(
+                tau_mean,
+                weights_mean,
+                source_mean,
+                surface_mean,
+                pressure,
+                temperature,
+                streams=2,
+                cp_air_j_kg_k=1004.0,
+                py2sess_repo=repo,
+                dtype_name="float32",
+                torch=torch,
+            )
+            up_int, down_int, heat_int = py2sess_forward_flux_rt(
+                tau_int,
+                torch.ones_like(weights_int),
+                source_int,
+                surface_int,
+                pressure,
+                temperature,
+                streams=2,
+                cp_air_j_kg_k=1004.0,
+                py2sess_repo=repo,
+                dtype_name="float32",
+                torch=torch,
+            )
+
+        np.testing.assert_allclose(up_int.detach().numpy(), up_mean.detach().numpy(), rtol=1.0e-6, atol=1.0e-7)
+        np.testing.assert_allclose(down_int.detach().numpy(), down_mean.detach().numpy(), rtol=1.0e-6, atol=1.0e-7)
+        np.testing.assert_allclose(heat_int.detach().numpy(), heat_mean.detach().numpy(), rtol=1.0e-6, atol=1.0e-6)
 
     def test_lw_rt_aware_requires_py2sess_forward_flux(self) -> None:
         batch = native_batch(profile_count=2, spectral_count=4)
@@ -230,6 +358,9 @@ class MinimalWorkflowTest(unittest.TestCase):
                     "mu_values": [0.5],
                     "surf_albedo": 0.1,
                     "include_fo": False,
+                    "sw_tau_mode": "direct_beam",
+                    "sw_tau_mu_ref": 0.5,
+                    "sw_rayleigh_mode": "arithmetic",
                     "train_pressure_min_hpa": 0.001,
                     "train_pressure_max_hpa": 1100.0,
                 },
@@ -247,6 +378,9 @@ class MinimalWorkflowTest(unittest.TestCase):
         self.assertEqual(training_log["teacher_kernel"], "py2sess_forward_flux_sw")
         self.assertEqual(training_log["mu_values"], [0.5])
         self.assertFalse(training_log["include_fo"])
+        self.assertEqual(training_log["sw_tau_mode"], "direct_beam")
+        self.assertEqual(training_log["sw_rayleigh_mode"], "arithmetic")
+        self.assertEqual(model.metadata["compression_settings"]["sw_tau_mu_ref"], 0.5)
 
     def test_sw_rt_aware_requires_source_terms(self) -> None:
         batch = native_batch(profile_count=2, spectral_count=4)

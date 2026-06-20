@@ -36,10 +36,12 @@ native-index binning. `rt-aware` trains a frozen assignment with py2sess
 `rt.train_teacher: py2sess`. Longwave uses the thermal source terms. Shortwave
 uses plane-parallel flux-only solar training with absorption optical depth,
 Rayleigh optical depth, CKDMIP solar irradiance, configured `rt.mu_values`, and
-surface albedo. SW heating loss uses net-flux divergence; SW flux loss still
-compares upwelling and downwelling fluxes to avoid cancellation. Formal
-validation and final scoring still use CKDMIP `ckdmip_lw` or `ckdmip_sw`, not
-py2sess.
+surface albedo. SW compressed optics default to direct-beam absorption closure
+at `nlpq.sw_tau_mu_ref` and solar-weighted arithmetic Rayleigh closure, so
+training and CKDMIP export use the same source-aware moments. SW heating loss
+uses net-flux divergence; SW flux loss still compares upwelling and downwelling
+fluxes to avoid cancellation. Formal validation and final scoring still use
+CKDMIP `ckdmip_lw` or `ckdmip_sw`, not py2sess.
 
 The current `rt-aware` method is assignment-only. `rt-aware-nn` is available
 for manual YAML runs when species-level CKDMIP optical depths are present. It
@@ -201,9 +203,12 @@ loads the frozen final model and writes test vertical outputs from Evaluation-2.
 - Formal compressed evaluation requires official CKDMIP spectra, flux truth,
   CKDMIP executables, and the domain-specific source terms required by CKDMIP
   CKD mode.
-- At finite Q, `compress_tau` preserves the native-weighted single-layer
-  transmittance inside each pseudo-line cluster. It does not, by construction,
-  conserve column transmittance, TOA flux, surface flux, or heating rate.
+- Full-band `Q=M` CKDMIP RT is not a required gate for large bands; identity
+  checks are unit-test or small-window diagnostics.
+- At finite Q, LW `compress_tau` preserves the native-weighted single-layer
+  transmittance inside each pseudo-line cluster. SW uses the configured
+  source-aware moments above. Neither closure, by construction, conserves
+  column transmittance, TOA flux, surface flux, or heating rate.
 - The current `rt-aware` closure learns only the hard native-to-Q assignment.
   NN optical-depth residuals are in the separate `rt-aware-nn` method.
 - `rt-aware-nn` requires species-level `species_tau_native`; official CKDMIP

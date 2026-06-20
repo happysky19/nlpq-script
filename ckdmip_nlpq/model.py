@@ -122,6 +122,7 @@ class NLPQModel:
                 "method": self.method,
                 "q_value": self.q_value,
                 "native_spectral_count": spectral_count,
+                "compression_settings": compression_settings(self.domain, training_config),
                 "fit_profile_ids": [int(v) for v in batch.profile_ids.tolist()],
                 "online_policy": "frozen assignment; no eval/test fitting",
                 "training_log": training_log,
@@ -140,7 +141,18 @@ class NLPQModel:
             raise RuntimeError("model must be frozen before apply")
         if self.cluster_id is None or self.weight_q is None:
             raise RuntimeError("model has no assignment")
-        tau_q = compress_tau(batch.tau_native, batch.spectral_weight, self.cluster_id, self.q_value)
+        settings = dict(self.metadata.get("compression_settings", compression_settings(self.domain, None)))
+        if self.domain == "sw":
+            tau_q, rayleigh_tau_q, incoming_flux_q = compress_sw_optics(
+                batch,
+                self.cluster_id,
+                self.q_value,
+                settings=settings,
+            )
+        else:
+            tau_q = compress_tau(batch.tau_native, batch.spectral_weight, self.cluster_id, self.q_value)
+            rayleigh_tau_q = None
+            incoming_flux_q = None
         if self.method == "rt-aware-nn" and self.nn_state is not None:
             from .nn_tau import apply_neural_overlap_residual
 
@@ -151,21 +163,6 @@ class NLPQModel:
                 q_value=self.q_value,
                 nn_state=self.nn_state,
                 target_tau_q=tau_q,
-            )
-        rayleigh_tau_q = None
-        if batch.rayleigh_tau_native is not None:
-            rayleigh_tau_q = compress_tau(
-                batch.rayleigh_tau_native,
-                batch.spectral_weight,
-                self.cluster_id,
-                self.q_value,
-            )
-        incoming_flux_q = None
-        if batch.incoming_flux_native is not None:
-            incoming_flux_q = compress_additive_spectral(
-                batch.incoming_flux_native,
-                self.cluster_id,
-                self.q_value,
             )
         return CompressedBatch(
             tau_q=tau_q,
@@ -295,6 +292,171 @@ def _assignment_training_name(method: str) -> str:
     if method == "det":
         return "regular_native_index_binning"
     return method
+
+
+def compression_settings(domain: str, training_config: dict[str, Any] | None) -> dict[str, Any]:
+    options = dict(training_config or {})
+    if domain != "sw":
+        return {}
+    tau_mode = str(options.get("sw_tau_mode", "direct_beam"))
+    rayleigh_mode = str(options.get("sw_rayleigh_mode", "arithmetic"))
+    mu_ref = float(options.get("sw_tau_mu_ref", options.get("sw_mu_ref", 0.5)))
+    if tau_mode not in {"transmittance", "direct_beam"}:
+        raise ValueError("sw_tau_mode must be transmittance or direct_beam")
+    if rayleigh_mode not in {"transmittance", "arithmetic", "direct_beam"}:
+        raise ValueError("sw_rayleigh_mode must be transmittance, arithmetic, or direct_beam")
+    if mu_ref <= 0.0 or mu_ref > 1.0:
+        raise ValueError("sw_tau_mu_ref must be in (0, 1]")
+    return {
+        "sw_tau_mode": tau_mode,
+        "sw_rayleigh_mode": rayleigh_mode,
+        "sw_tau_mu_ref": mu_ref,
+    }
+
+
+def compress_sw_optics(
+    batch: NativeBatch,
+    cluster_id: np.ndarray,
+    q_value: int,
+    *,
+    settings: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    tau_mode = str(settings.get("sw_tau_mode", "direct_beam"))
+    rayleigh_mode = str(settings.get("sw_rayleigh_mode", "arithmetic"))
+    mu_ref = float(settings.get("sw_tau_mu_ref", 0.5))
+    if tau_mode == "direct_beam":
+        tau_q = compress_direct_beam_tau(
+            batch.tau_native,
+            batch.incoming_flux_native,
+            batch.spectral_weight,
+            cluster_id,
+            q_value,
+            mu_ref=mu_ref,
+        )
+    else:
+        tau_q = compress_tau(batch.tau_native, batch.spectral_weight, cluster_id, q_value)
+
+    rayleigh_tau_q = None
+    if batch.rayleigh_tau_native is not None:
+        if rayleigh_mode == "arithmetic":
+            rayleigh_tau_q = compress_solar_weighted_mean_tau(
+                batch.rayleigh_tau_native,
+                batch.incoming_flux_native,
+                batch.spectral_weight,
+                cluster_id,
+                q_value,
+            )
+        elif rayleigh_mode == "direct_beam":
+            rayleigh_tau_q = compress_direct_beam_tau(
+                batch.rayleigh_tau_native,
+                batch.incoming_flux_native,
+                batch.spectral_weight,
+                cluster_id,
+                q_value,
+                mu_ref=mu_ref,
+            )
+        else:
+            rayleigh_tau_q = compress_tau(batch.rayleigh_tau_native, batch.spectral_weight, cluster_id, q_value)
+
+    incoming_flux_q = None
+    if batch.incoming_flux_native is not None:
+        incoming_flux_q = compress_additive_spectral(batch.incoming_flux_native, cluster_id, q_value)
+    return tau_q, rayleigh_tau_q, incoming_flux_q
+
+
+def compress_direct_beam_tau(
+    tau_native: np.ndarray,
+    incoming_flux_native: np.ndarray | None,
+    spectral_weight: np.ndarray,
+    cluster_id: np.ndarray,
+    q_value: int,
+    *,
+    mu_ref: float,
+) -> np.ndarray:
+    tau = np.asarray(tau_native, dtype=np.float64)
+    cluster = np.asarray(cluster_id, dtype=np.int64)
+    if tau.shape[-1] != cluster.shape[0]:
+        raise ValueError("native spectral dimensions do not match assignment")
+    if q_value == tau.shape[-1] and np.array_equal(cluster, np.arange(tau.shape[-1])):
+        return np.maximum(tau, EPS)
+    source_weight = _source_weights(incoming_flux_native, spectral_weight, tau.shape[0], tau.shape[-1])
+    out = np.empty(tau.shape[:-1] + (q_value,), dtype=np.float64)
+    mu = max(float(mu_ref), EPS)
+    trans = np.exp(-np.minimum(np.maximum(tau, 0.0) / mu, 700.0))
+    for q in range(q_value):
+        mask = cluster == q
+        if not np.any(mask):
+            raise ValueError("every pseudo-line cluster must be nonempty")
+        w = source_weight[:, mask]
+        denom = np.sum(w, axis=1)
+        if np.any(denom <= 0.0):
+            fallback = _fallback_weights(spectral_weight, mask)
+            w = np.where(denom[:, None] > 0.0, w, fallback[None, :])
+            denom = np.sum(w, axis=1)
+        avg_trans = np.sum(trans[..., mask] * w[:, None, :], axis=-1) / denom[:, None]
+        out[..., q] = -mu * np.log(np.clip(avg_trans, EPS, 1.0))
+    return np.maximum(out, EPS)
+
+
+def compress_solar_weighted_mean_tau(
+    tau_native: np.ndarray,
+    incoming_flux_native: np.ndarray | None,
+    spectral_weight: np.ndarray,
+    cluster_id: np.ndarray,
+    q_value: int,
+) -> np.ndarray:
+    tau = np.asarray(tau_native, dtype=np.float64)
+    cluster = np.asarray(cluster_id, dtype=np.int64)
+    if tau.shape[-1] != cluster.shape[0]:
+        raise ValueError("native spectral dimensions do not match assignment")
+    if q_value == tau.shape[-1] and np.array_equal(cluster, np.arange(tau.shape[-1])):
+        return np.maximum(tau, EPS)
+    source_weight = _source_weights(incoming_flux_native, spectral_weight, tau.shape[0], tau.shape[-1])
+    out = np.empty(tau.shape[:-1] + (q_value,), dtype=np.float64)
+    for q in range(q_value):
+        mask = cluster == q
+        if not np.any(mask):
+            raise ValueError("every pseudo-line cluster must be nonempty")
+        w = source_weight[:, mask]
+        denom = np.sum(w, axis=1)
+        if np.any(denom <= 0.0):
+            fallback = _fallback_weights(spectral_weight, mask)
+            w = np.where(denom[:, None] > 0.0, w, fallback[None, :])
+            denom = np.sum(w, axis=1)
+        out[..., q] = np.sum(np.maximum(tau[..., mask], 0.0) * w[:, None, :], axis=-1) / denom[:, None]
+    return np.maximum(out, EPS)
+
+
+def _source_weights(
+    incoming_flux_native: np.ndarray | None,
+    spectral_weight: np.ndarray,
+    profile_count: int,
+    spectral_count: int,
+) -> np.ndarray:
+    if incoming_flux_native is None:
+        weight = np.asarray(spectral_weight, dtype=np.float64)
+        if weight.shape != (spectral_count,):
+            raise ValueError("spectral_weight shape does not match native spectral dimension")
+        return np.broadcast_to(np.maximum(weight, 0.0), (profile_count, spectral_count)).copy()
+    incoming = np.asarray(incoming_flux_native, dtype=np.float64)
+    if incoming.ndim == 1:
+        if incoming.shape != (spectral_count,):
+            raise ValueError("incoming_flux_native spectral dimension does not match assignment")
+        return np.broadcast_to(np.maximum(incoming, 0.0), (profile_count, spectral_count)).copy()
+    if incoming.ndim == 2:
+        if incoming.shape != (profile_count, spectral_count):
+            raise ValueError("incoming_flux_native must have shape [M] or [B,M]")
+        return np.maximum(incoming, 0.0)
+    raise ValueError("incoming_flux_native must have shape [M] or [B,M]")
+
+
+def _fallback_weights(spectral_weight: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    weight = np.asarray(spectral_weight, dtype=np.float64)[mask]
+    weight = np.maximum(weight, 0.0)
+    total = float(np.sum(weight))
+    if total <= 0.0:
+        return np.full(np.count_nonzero(mask), 1.0 / float(np.count_nonzero(mask)), dtype=np.float64)
+    return weight / total
 
 
 def _encode_nn_state(nn_state: dict[str, Any] | None) -> dict[str, np.ndarray]:

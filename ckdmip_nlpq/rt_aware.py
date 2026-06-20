@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from .export import PLANCK_C1, PLANCK_C2
-from .model import NativeBatch
+from .model import NativeBatch, compression_settings
 from .rt import check_py2sess_forward_flux_available
 
 
@@ -69,6 +69,17 @@ def train_rt_aware_assignment(
     source_level = _planck_level_source(batch, dtype=dtype, device=device, torch=torch)
     source_layer = 0.5 * (source_level[:, :-1, :] + source_level[:, 1:, :])
     surface_source = source_level[:, -1, :]
+    lw_source_mode = str(options.get("lw_source_mode", options.get("source_mode", "ckdmip_integrated")))
+    if lw_source_mode not in {"ckdmip_integrated", "weighted_mean"}:
+        raise ValueError("lw_source_mode must be ckdmip_integrated or weighted_mean")
+    if lw_source_mode == "ckdmip_integrated":
+        reference_source_level = source_level * alpha[None, None, :]
+        reference_surface_source = surface_source * alpha[None, :]
+        reference_weights = torch.ones_like(alpha)
+    else:
+        reference_source_level = source_level
+        reference_surface_source = surface_source
+        reference_weights = alpha
 
     m_count = int(tau.shape[-1])
     if q_value > m_count:
@@ -111,9 +122,9 @@ def train_rt_aware_assignment(
     with torch.no_grad():
         ref_up, ref_down, ref_heat = py2sess_forward_flux_rt(
             tau,
-            alpha,
-            source_level,
-            surface_source,
+            reference_weights,
+            reference_source_level,
+            reference_surface_source,
             pressure_hl,
             temperature_hl,
             streams=streams,
@@ -145,19 +156,28 @@ def train_rt_aware_assignment(
     for step in range(steps):
         optimizer.zero_grad(set_to_none=True)
         probabilities = torch.softmax(logits / max(temperature, EPS), dim=1)
-        weights_q, tau_q, surface_q = _checkpoint_if_enabled(
-            use_checkpoint,
-            lambda p: compress_soft(p, alpha, tau, surface_source, torch=torch),
-            probabilities,
-        )
-        source_level_q = _checkpoint_if_enabled(
-            use_checkpoint,
-            lambda p: compress_soft_level_source(p, alpha, source_level, torch=torch),
-            probabilities,
-        )
+        if lw_source_mode == "ckdmip_integrated":
+            weights_q, tau_q, source_level_q, surface_q = _checkpoint_if_enabled(
+                use_checkpoint,
+                lambda p: compress_soft_integrated_source(p, alpha, tau, source_level, surface_source, torch=torch),
+                probabilities,
+            )
+            flux_weights_q = torch.ones_like(weights_q)
+        else:
+            weights_q, tau_q, surface_q = _checkpoint_if_enabled(
+                use_checkpoint,
+                lambda p: compress_soft(p, alpha, tau, surface_source, torch=torch),
+                probabilities,
+            )
+            source_level_q = _checkpoint_if_enabled(
+                use_checkpoint,
+                lambda p: compress_soft_level_source(p, alpha, source_level, torch=torch),
+                probabilities,
+            )
+            flux_weights_q = weights_q
         up, down, heat = py2sess_forward_flux_rt(
             tau_q,
-            weights_q,
+            flux_weights_q,
             source_level_q,
             surface_q,
             pressure_hl,
@@ -217,6 +237,7 @@ def train_rt_aware_assignment(
         "steps": steps,
         "lr": lr,
         "streams": streams,
+        "lw_source_mode": lw_source_mode,
         "dtype": str(options.get("dtype", "float32")),
         "device": str(device),
         "train_pressure_min_hpa": float(options.get("train_pressure_min_hpa", 0.001)),
@@ -254,6 +275,10 @@ def train_sw_rt_aware_assignment(
         raise ValueError("SW rt-aware training requires incoming_flux_native from CKDMIP SSI")
     if batch.rayleigh_tau_native is None and not bool(options.get("allow_zero_rayleigh", False)):
         raise ValueError("SW rt-aware training requires rayleigh_tau_native")
+    settings = compression_settings("sw", options)
+    sw_tau_mode = str(settings["sw_tau_mode"])
+    sw_rayleigh_mode = str(settings["sw_rayleigh_mode"])
+    sw_tau_mu_ref = float(settings["sw_tau_mu_ref"])
 
     dtype = _torch_dtype(str(options.get("dtype", "float32")), torch)
     device = torch.device(str(options.get("device", "cpu")))
@@ -362,7 +387,17 @@ def train_sw_rt_aware_assignment(
         probabilities = torch.softmax(logits / max(temperature, EPS), dim=1)
         weights_q, tau_abs_q, rayleigh_q, incoming_q = _checkpoint_if_enabled(
             use_checkpoint,
-            lambda p: compress_soft_sw(p, alpha, tau_abs, rayleigh, incoming, torch=torch),
+            lambda p: compress_soft_sw(
+                p,
+                alpha,
+                tau_abs,
+                rayleigh,
+                incoming,
+                tau_mode=sw_tau_mode,
+                rayleigh_mode=sw_rayleigh_mode,
+                mu_ref=sw_tau_mu_ref,
+                torch=torch,
+            ),
             probabilities,
         )
         up, down, heat = py2sess_forward_flux_sw(
@@ -435,6 +470,9 @@ def train_sw_rt_aware_assignment(
         "mu_values": mu_values,
         "surf_albedo": surf_albedo,
         "include_fo": include_fo,
+        "sw_tau_mode": sw_tau_mode,
+        "sw_rayleigh_mode": sw_rayleigh_mode,
+        "sw_tau_mu_ref": sw_tau_mu_ref,
         "dtype": str(options.get("dtype", "float32")),
         "device": str(device),
         "train_pressure_min_hpa": float(options.get("train_pressure_min_hpa", 0.001)),
@@ -465,6 +503,27 @@ def compress_soft(
     return weights_q, tau_blq.clamp_min(EPS), surface_source_bq
 
 
+def compress_soft_integrated_source(
+    probabilities_mq: Any,
+    alpha_m: Any,
+    tau_blm: Any,
+    source_level_bkm: Any,
+    surface_source_bm: Any,
+    *,
+    torch: Any,
+) -> tuple[Any, Any, Any, Any]:
+    """Compress LW tau with transmittance closure and CKDMIP-style integrated source."""
+
+    weighted_mq = alpha_m[:, None] * probabilities_mq
+    weights_q = weighted_mq.sum(dim=0).clamp_min(EPS)
+    trans = torch.exp(-torch.clamp(tau_blm, min=0.0, max=700.0))
+    avg_trans = torch.einsum("mq,blm->blq", weighted_mq, trans) / weights_q[None, None, :]
+    tau_blq = (-torch.log(avg_trans.clamp_min(EPS))).clamp_min(EPS)
+    source_level_bkq = torch.einsum("mq,bkm->bkq", weighted_mq, source_level_bkm)
+    surface_source_bq = torch.einsum("mq,bm->bq", weighted_mq, surface_source_bm)
+    return weights_q, tau_blq, source_level_bkq, surface_source_bq
+
+
 def compress_soft_sw(
     probabilities_mq: Any,
     alpha_m: Any,
@@ -472,12 +531,42 @@ def compress_soft_sw(
     rayleigh_blm: Any,
     incoming_bm: Any,
     *,
+    tau_mode: str = "direct_beam",
+    rayleigh_mode: str = "arithmetic",
+    mu_ref: float = 0.5,
     torch: Any,
 ) -> tuple[Any, Any, Any, Any]:
     weighted_mq = alpha_m[:, None] * probabilities_mq
     weights_q = weighted_mq.sum(dim=0).clamp_min(EPS)
-    tau_abs_blq = _compress_tau_soft(probabilities_mq, alpha_m, tau_abs_blm, torch=torch)
-    rayleigh_blq = _compress_tau_soft(probabilities_mq, alpha_m, rayleigh_blm, torch=torch)
+    if tau_mode == "direct_beam":
+        tau_abs_blq = _compress_tau_soft_direct_beam(
+            probabilities_mq,
+            alpha_m,
+            tau_abs_blm,
+            incoming_bm,
+            mu_ref=mu_ref,
+            torch=torch,
+        )
+    elif tau_mode == "transmittance":
+        tau_abs_blq = _compress_tau_soft(probabilities_mq, alpha_m, tau_abs_blm, torch=torch)
+    else:
+        raise ValueError("sw_tau_mode must be transmittance or direct_beam")
+
+    if rayleigh_mode == "arithmetic":
+        rayleigh_blq = _compress_tau_soft_solar_mean(probabilities_mq, alpha_m, rayleigh_blm, incoming_bm, torch=torch)
+    elif rayleigh_mode == "direct_beam":
+        rayleigh_blq = _compress_tau_soft_direct_beam(
+            probabilities_mq,
+            alpha_m,
+            rayleigh_blm,
+            incoming_bm,
+            mu_ref=mu_ref,
+            torch=torch,
+        )
+    elif rayleigh_mode == "transmittance":
+        rayleigh_blq = _compress_tau_soft(probabilities_mq, alpha_m, rayleigh_blm, torch=torch)
+    else:
+        raise ValueError("sw_rayleigh_mode must be transmittance, arithmetic, or direct_beam")
     incoming_bq = torch.einsum("mq,bm->bq", probabilities_mq, incoming_bm).clamp_min(0.0)
     return weights_q, tau_abs_blq, rayleigh_blq, incoming_bq
 
@@ -493,7 +582,49 @@ def _compress_tau_soft(
     weights_q = weighted_mq.sum(dim=0).clamp_min(EPS)
     trans = torch.exp(-torch.clamp(tau_blm, min=0.0, max=700.0))
     avg_trans = torch.einsum("mq,blm->blq", weighted_mq, trans) / weights_q[None, None, :]
-    return -torch.log(avg_trans.clamp_min(EPS)).clamp_min(EPS)
+    return (-torch.log(avg_trans.clamp_min(EPS))).clamp_min(EPS)
+
+
+def _compress_tau_soft_direct_beam(
+    probabilities_mq: Any,
+    alpha_m: Any,
+    tau_blm: Any,
+    incoming_bm: Any,
+    *,
+    mu_ref: float,
+    torch: Any,
+) -> Any:
+    source_bmq, denom_bq = _soft_source_weights(probabilities_mq, alpha_m, incoming_bm, torch=torch)
+    mu = max(float(mu_ref), EPS)
+    trans = torch.exp(-torch.clamp(torch.clamp(tau_blm, min=0.0) / mu, max=700.0))
+    avg_trans = torch.einsum("bmq,blm->blq", source_bmq, trans) / denom_bq[:, None, :]
+    return (-mu * torch.log(avg_trans.clamp_min(EPS))).clamp_min(EPS)
+
+
+def _compress_tau_soft_solar_mean(
+    probabilities_mq: Any,
+    alpha_m: Any,
+    tau_blm: Any,
+    incoming_bm: Any,
+    *,
+    torch: Any,
+) -> Any:
+    source_bmq, denom_bq = _soft_source_weights(probabilities_mq, alpha_m, incoming_bm, torch=torch)
+    return (
+        torch.einsum("bmq,blm->blq", source_bmq, torch.clamp(tau_blm, min=0.0))
+        / denom_bq[:, None, :]
+    ).clamp_min(EPS)
+
+
+def _soft_source_weights(probabilities_mq: Any, alpha_m: Any, incoming_bm: Any, *, torch: Any) -> tuple[Any, Any]:
+    source_bmq = torch.clamp(incoming_bm, min=0.0)[:, :, None] * probabilities_mq[None, :, :]
+    source_denom_bq = source_bmq.sum(dim=1)
+    fallback_mq = torch.clamp(alpha_m, min=0.0)[:, None] * probabilities_mq
+    fallback_denom_q = fallback_mq.sum(dim=0).clamp_min(EPS)
+    use_source_bq = source_denom_bq > EPS
+    weights_bmq = torch.where(use_source_bq[:, None, :], source_bmq, fallback_mq[None, :, :])
+    denom_bq = torch.where(use_source_bq, source_denom_bq, fallback_denom_q[None, :]).clamp_min(EPS)
+    return weights_bmq, denom_bq
 
 
 def compress_soft_level_source(
@@ -720,10 +851,15 @@ def sw_feature_reconstruction_loss(
         tau_abs_blm.shape[0] * tau_abs_blm.shape[1]
     )
     incoming_m = torch.mean(incoming_bm, dim=0)
-    incoming_q = torch.einsum("mq,m->q", weighted_mq, incoming_m) / weights_q
-    incoming_hat = torch.einsum("mq,q->m", probabilities_mq, incoming_q)
-    incoming_scale = torch.sqrt(torch.mean(torch.square(incoming_m))).clamp_min(EPS)
-    incoming_loss = torch.mean(torch.square((incoming_hat - incoming_m) / incoming_scale))
+    incoming_density = incoming_m / alpha_m.clamp_min(EPS)
+    incoming_density_q = torch.einsum("mq,m->q", probabilities_mq, incoming_m) / weights_q
+    incoming_density_hat = torch.einsum("mq,q->m", probabilities_mq, incoming_density_q)
+    incoming_scale = torch.sqrt(torch.einsum("m,m->", alpha_norm, torch.square(incoming_density))).clamp_min(EPS)
+    incoming_loss = torch.einsum(
+        "m,m->",
+        alpha_norm,
+        torch.square((incoming_density_hat - incoming_density) / incoming_scale),
+    )
     return tau_loss + 0.05 * incoming_loss
 
 
