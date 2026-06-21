@@ -11,7 +11,7 @@ import numpy as np
 
 
 EPS = 1.0e-12
-ALLOWED_METHODS = {"det", "rt-aware", "rt-aware-nn"}
+ALLOWED_METHODS = {"det", "rt-aware", "rt-aware-current", "rt-aware-path", "rt-aware-nn"}
 
 
 @dataclass(frozen=True)
@@ -81,15 +81,21 @@ class NLPQModel:
             cluster_id = np.arange(spectral_count, dtype=np.int64)
             weight_q = _cluster_weights(batch.spectral_weight, cluster_id, self.q_value)
             training_log: dict[str, Any] = {"assignment_training": "identity", "steps": 0}
-        elif self.method in ("rt-aware", "rt-aware-nn"):
+        elif self.method in ("rt-aware", "rt-aware-current", "rt-aware-path", "rt-aware-nn"):
             from .rt_aware import train_rt_aware_assignment
 
+            method_training_config = dict(training_config or {})
+            if self.method == "rt-aware-current":
+                method_training_config["rt_aware_path_weight"] = 0.0
+            if self.method in ("rt-aware", "rt-aware-path"):
+                method_training_config.setdefault("rt_aware_path_weight", 0.05)
+            method_training_config["rt_aware_method_variant"] = self.method
             cluster_id, weight_q, training_log = train_rt_aware_assignment(
                 batch,
                 domain=self.domain,
                 q_value=self.q_value,
                 seed=self.seed,
-                training_config=training_config,
+                training_config=method_training_config,
                 py2sess_repo=py2sess_repo,
             )
             if self.method == "rt-aware-nn" and self.q_value < spectral_count:
@@ -297,7 +303,10 @@ def _assignment_training_name(method: str) -> str:
 def compression_settings(domain: str, training_config: dict[str, Any] | None) -> dict[str, Any]:
     options = dict(training_config or {})
     if domain != "sw":
-        return {}
+        source_mode = str(options.get("lw_source_mode", options.get("source_mode", "ckdmip_integrated")))
+        if source_mode != "ckdmip_integrated":
+            raise ValueError("lw_source_mode must be ckdmip_integrated for CKDMIP export")
+        return {"lw_source_mode": source_mode}
     tau_mode = str(options.get("sw_tau_mode", "direct_beam"))
     rayleigh_mode = str(options.get("sw_rayleigh_mode", "arithmetic"))
     mu_ref = float(options.get("sw_tau_mu_ref", options.get("sw_mu_ref", 0.5)))

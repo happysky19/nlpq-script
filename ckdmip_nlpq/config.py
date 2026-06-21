@@ -10,7 +10,7 @@ import yaml
 
 
 ALLOWED_DOMAINS = {"sw", "lw"}
-ALLOWED_METHODS = {"det", "rt-aware", "rt-aware-nn"}
+ALLOWED_METHODS = {"det", "rt-aware", "rt-aware-current", "rt-aware-path", "rt-aware-nn"}
 ALLOWED_STAGES = {
     "preflight",
     "download",

@@ -22,13 +22,17 @@ split:
     test_profiles: "0-49"
 
 nlpq:
-  methods: [det, rt-aware]
+  methods: [det, rt-aware-current, rt-aware-path]
   q_values: [6, 9, 12, 16]
   train_pressure_min_hpa: 0.001
   train_pressure_max_hpa: 1100.0
   sw_tau_mode: direct_beam
   sw_tau_mu_ref: 0.5
   sw_rayleigh_mode: arithmetic
+  rt_aware_flux_weight: 1.0
+  rt_aware_heating_weight: 4.0
+  rt_aware_path_weight: 0.05
+  rt_aware_feature_weight: 0.05
   seed: 19
 
 training:

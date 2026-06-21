@@ -44,20 +44,20 @@ moments. SW heating loss uses net-flux divergence; SW flux loss still compares
 upwelling and downwelling fluxes to avoid cancellation. Formal validation and
 final scoring still use CKDMIP `ckdmip_lw` or `ckdmip_sw`, not py2sess.
 
-The current `rt-aware` method is assignment-only. `rt-aware-nn` is available
-for manual YAML runs when species-level CKDMIP optical depths are present. It
-uses the same frozen assignment path, then applies a frozen Q-space neural
-overlap residual to export NN-corrected optical depth.
+The main `rt-aware-path` method is assignment-only with flux, heating, and
+source/path-aware training losses. `rt-aware-current` keeps the same teacher
+but disables the path loss for method comparison. `rt-aware-nn` is available
+for manual YAML runs only when species-level CKDMIP optical depths are present.
 
 ## Configure
 
-Copy and edit the longwave `det + rt-aware` example:
+Copy and edit the longwave `det + rt-aware-current + rt-aware-path` example:
 
 ```bash
 cp configs/example.yaml run_lw_band04.yaml
 ```
 
-For a shortwave `det + rt-aware` run, start from:
+For a shortwave `det + rt-aware-current + rt-aware-path` run, start from:
 
 ```bash
 cp configs/example_sw.yaml run_sw_band02.yaml
@@ -74,7 +74,7 @@ YAML:
 
 ```yaml
 nlpq:
-  methods: [det, rt-aware, rt-aware-nn]
+  methods: [det, rt-aware-path, rt-aware-nn]
 training:
   nn_steps: 200
 ```
@@ -207,12 +207,13 @@ loads the frozen final model and writes test vertical outputs from Evaluation-2.
   CKD mode.
 - Full-band `Q=M` CKDMIP RT is not a required gate for large bands; identity
   checks are unit-test or small-window diagnostics.
-- At finite Q, LW `compress_tau` preserves the native-weighted single-layer
-  transmittance inside each pseudo-line cluster. SW uses the configured
-  source-aware moments above. Neither closure, by construction, conserves
-  column transmittance, TOA flux, surface flux, or heating rate.
-- The current `rt-aware` closure learns only the hard native-to-Q assignment.
-  NN optical-depth residuals are in the separate `rt-aware-nn` method.
+- At finite Q, deterministic compression preserves only configured intra-cluster
+  moments. `rt-aware-path` adds LW source/escape and SW cumulative direct-beam
+  path losses during training; official validation still determines whether the
+  finite-Q closure preserves fluxes or heating.
+- The current `rt-aware-path` closure learns only the hard native-to-Q
+  assignment. NN optical-depth residuals are in the separate `rt-aware-nn`
+  method.
 - `rt-aware-nn` requires species-level `species_tau_native`; official CKDMIP
   spectra loading provides this, and custom NPZ batches must include it.
 - The current compressed model is a frozen assignment applied to native optical

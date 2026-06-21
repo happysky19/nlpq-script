@@ -70,8 +70,8 @@ def train_rt_aware_assignment(
     source_layer = 0.5 * (source_level[:, :-1, :] + source_level[:, 1:, :])
     surface_source = source_level[:, -1, :]
     lw_source_mode = str(options.get("lw_source_mode", options.get("source_mode", "ckdmip_integrated")))
-    if lw_source_mode not in {"ckdmip_integrated", "weighted_mean"}:
-        raise ValueError("lw_source_mode must be ckdmip_integrated or weighted_mean")
+    if lw_source_mode != "ckdmip_integrated":
+        raise ValueError("lw_source_mode must be ckdmip_integrated for CKDMIP export")
     if lw_source_mode == "ckdmip_integrated":
         reference_source_level = source_level * alpha[None, None, :]
         reference_surface_source = surface_source * alpha[None, :]
@@ -96,11 +96,13 @@ def train_rt_aware_assignment(
 
     streams = int(options.get("streams", options.get("lw_streams", 4)))
     cp_air = float(options.get("cp_air_j_kg_k", 1004.0))
-    flux_weight = float(options.get("flux_loss_weight", 1.0))
-    heating_weight = float(options.get("heating_loss_weight", 1.0))
-    feature_weight = float(options.get("feature_loss_weight", 0.05))
+    flux_weight = _training_float(options, "rt_aware_flux_weight", "flux_loss_weight", default=1.0)
+    heating_weight = _training_float(options, "rt_aware_heating_weight", "heating_loss_weight", default=10.0)
+    path_weight = _training_float(options, "rt_aware_path_weight", "path_loss_weight", default=0.05)
+    feature_weight = _training_float(options, "rt_aware_feature_weight", "feature_loss_weight", default=0.05)
     usage_weight = float(options.get("usage_loss_weight", 0.001))
     entropy_weight = float(options.get("entropy_loss_weight", 0.0005))
+    path_spectral_chunk = int(options.get("path_loss_spectral_chunk", 8192))
     temperature = float(options.get("assignment_temperature", 1.0))
     log_every = max(1, int(options.get("log_every_steps", max(1, steps // 5))))
     max_rt_rows = _max_py2sess_rows(options)
@@ -198,12 +200,27 @@ def train_rt_aware_assignment(
             lambda p: feature_reconstruction_loss(p, alpha, tau, source_layer, torch=torch),
             probabilities,
         )
+        path_loss = tau.new_tensor(0.0)
+        if path_weight != 0.0:
+            path_loss = lw_source_path_loss(
+                probabilities,
+                alpha,
+                tau,
+                source_level,
+                tau_q,
+                source_level_q,
+                weights_q,
+                source_mode=lw_source_mode,
+                spectral_chunk=path_spectral_chunk,
+                torch=torch,
+            )
         target_weight = torch.full_like(weights_q, 1.0 / float(q_value))
         usage_loss = torch.mean(torch.square((weights_q - target_weight) / target_weight.clamp_min(EPS)))
         entropy = -torch.sum(probabilities * torch.log(probabilities.clamp_min(EPS)), dim=1).mean()
         loss = (
             flux_weight * flux_loss
             + heating_weight * heat_loss
+            + path_weight * path_loss
             + feature_weight * feature_loss
             + usage_weight * usage_loss
             + entropy_weight * entropy
@@ -218,6 +235,7 @@ def train_rt_aware_assignment(
                     "loss": float(loss.detach().cpu()),
                     "flux_loss": float(flux_loss.detach().cpu()),
                     "heating_loss": float(heat_loss.detach().cpu()),
+                    "path_loss": float(path_loss.detach().cpu()),
                     "feature_loss": float(feature_loss.detach().cpu()),
                     "usage_loss": float(usage_loss.detach().cpu()),
                     "entropy": float(entropy.detach().cpu()),
@@ -238,6 +256,11 @@ def train_rt_aware_assignment(
         "lr": lr,
         "streams": streams,
         "lw_source_mode": lw_source_mode,
+        "rt_aware_method_variant": str(options.get("rt_aware_method_variant", "rt-aware")),
+        "flux_loss_weight": flux_weight,
+        "heating_loss_weight": heating_weight,
+        "path_loss_weight": path_weight,
+        "feature_loss_weight": feature_weight,
         "dtype": str(options.get("dtype", "float32")),
         "device": str(device),
         "train_pressure_min_hpa": float(options.get("train_pressure_min_hpa", 0.001)),
@@ -248,6 +271,7 @@ def train_rt_aware_assignment(
         log["teacher_loss_final"] = history[-1]["loss"]
         log["teacher_flux_loss_final"] = history[-1]["flux_loss"]
         log["teacher_heating_loss_final"] = history[-1]["heating_loss"]
+        log["teacher_path_loss_final"] = history[-1]["path_loss"]
     return cluster_id, weight_q, log
 
 
@@ -321,11 +345,13 @@ def train_sw_rt_aware_assignment(
     if include_fo and not plane_parallel:
         raise ValueError("SW forward_flux include_fo=True requires sw_plane_parallel=true")
     stream_value = float(options.get("stream", 1.0 / math.sqrt(3.0)))
-    flux_weight = float(options.get("flux_loss_weight", 1.0))
-    heating_weight = float(options.get("heating_loss_weight", 1.0))
-    feature_weight = float(options.get("feature_loss_weight", 0.05))
+    flux_weight = _training_float(options, "rt_aware_flux_weight", "flux_loss_weight", default=1.0)
+    heating_weight = _training_float(options, "rt_aware_heating_weight", "heating_loss_weight", default=4.0)
+    path_weight = _training_float(options, "rt_aware_path_weight", "path_loss_weight", default=0.05)
+    feature_weight = _training_float(options, "rt_aware_feature_weight", "feature_loss_weight", default=0.05)
     usage_weight = float(options.get("usage_loss_weight", 0.001))
     entropy_weight = float(options.get("entropy_loss_weight", 0.0005))
+    path_spectral_chunk = int(options.get("path_loss_spectral_chunk", 8192))
     temperature = float(options.get("assignment_temperature", 1.0))
     log_every = max(1, int(options.get("log_every_steps", max(1, steps // 5))))
     max_rt_rows = _max_py2sess_rows(options)
@@ -431,12 +457,27 @@ def train_sw_rt_aware_assignment(
             lambda p: sw_feature_reconstruction_loss(p, alpha, tau_abs, rayleigh, incoming, torch=torch),
             probabilities,
         )
+        path_loss = tau_abs.new_tensor(0.0)
+        if path_weight != 0.0:
+            path_loss = sw_direct_path_loss(
+                probabilities,
+                tau_abs,
+                rayleigh,
+                incoming,
+                tau_abs_q,
+                rayleigh_q,
+                incoming_q,
+                mu_values=mu_values,
+                spectral_chunk=path_spectral_chunk,
+                torch=torch,
+            )
         target_weight = torch.full_like(weights_q, 1.0 / float(q_value))
         usage_loss = torch.mean(torch.square((weights_q - target_weight) / target_weight.clamp_min(EPS)))
         entropy = -torch.sum(probabilities * torch.log(probabilities.clamp_min(EPS)), dim=1).mean()
         loss = (
             flux_weight * flux_loss
             + heating_weight * heat_loss
+            + path_weight * path_loss
             + feature_weight * feature_loss
             + usage_weight * usage_loss
             + entropy_weight * entropy
@@ -451,6 +492,7 @@ def train_sw_rt_aware_assignment(
                     "loss": float(loss.detach().cpu()),
                     "flux_loss": float(flux_loss.detach().cpu()),
                     "heating_loss": float(heat_loss.detach().cpu()),
+                    "path_loss": float(path_loss.detach().cpu()),
                     "feature_loss": float(feature_loss.detach().cpu()),
                     "usage_loss": float(usage_loss.detach().cpu()),
                     "entropy": float(entropy.detach().cpu()),
@@ -477,6 +519,11 @@ def train_sw_rt_aware_assignment(
         "sw_tau_mode": sw_tau_mode,
         "sw_rayleigh_mode": sw_rayleigh_mode,
         "sw_tau_mu_ref": sw_tau_mu_ref,
+        "rt_aware_method_variant": str(options.get("rt_aware_method_variant", "rt-aware")),
+        "flux_loss_weight": flux_weight,
+        "heating_loss_weight": heating_weight,
+        "path_loss_weight": path_weight,
+        "feature_loss_weight": feature_weight,
         "dtype": str(options.get("dtype", "float32")),
         "device": str(device),
         "train_pressure_min_hpa": float(options.get("train_pressure_min_hpa", 0.001)),
@@ -487,6 +534,7 @@ def train_sw_rt_aware_assignment(
         log["teacher_loss_final"] = history[-1]["loss"]
         log["teacher_flux_loss_final"] = history[-1]["flux_loss"]
         log["teacher_heating_loss_final"] = history[-1]["heating_loss"]
+        log["teacher_path_loss_final"] = history[-1]["path_loss"]
     return cluster_id, weight_q, log
 
 
@@ -866,6 +914,116 @@ def sw_feature_reconstruction_loss(
         torch.square((incoming_density_hat - incoming_density) / incoming_scale),
     )
     return tau_loss + 0.05 * incoming_loss
+
+
+def lw_source_path_loss(
+    probabilities_mq: Any,
+    alpha_m: Any,
+    tau_blm: Any,
+    source_level_bkm: Any,
+    tau_blq: Any,
+    source_level_bkq: Any,
+    weights_q: Any,
+    *,
+    source_mode: str,
+    spectral_chunk: int,
+    torch: Any,
+) -> Any:
+    """Match source-weighted cumulative LW escape proxies, not only layer tau."""
+
+    if source_mode == "ckdmip_integrated":
+        source_weight_bkq = source_level_bkq
+    elif source_mode == "weighted_mean":
+        source_weight_bkq = source_level_bkq * weights_q[None, None, :]
+    else:
+        raise ValueError("unknown LW source mode")
+    mu = 1.0 / math.sqrt(3.0)
+    q_top, q_surface = _level_cumulative_tau(tau_blq, torch=torch)
+    pred_top = torch.sum(source_weight_bkq * torch.exp(-torch.clamp(q_top / mu, max=700.0)), dim=-1)
+    pred_surface = torch.sum(source_weight_bkq * torch.exp(-torch.clamp(q_surface / mu, max=700.0)), dim=-1)
+
+    ref_top = tau_blm.new_zeros(pred_top.shape)
+    ref_surface = tau_blm.new_zeros(pred_surface.shape)
+    chunk = max(1, int(spectral_chunk))
+    for start in range(0, int(tau_blm.shape[-1]), chunk):
+        stop = min(int(tau_blm.shape[-1]), start + chunk)
+        tau_chunk = torch.clamp(tau_blm[:, :, start:stop], min=0.0)
+        source_chunk = source_level_bkm[:, :, start:stop] * alpha_m[start:stop][None, None, :]
+        native_top, native_surface = _level_cumulative_tau(tau_chunk, torch=torch)
+        ref_top = ref_top + torch.sum(
+            source_chunk * torch.exp(-torch.clamp(native_top / mu, max=700.0)),
+            dim=-1,
+        )
+        ref_surface = ref_surface + torch.sum(
+            source_chunk * torch.exp(-torch.clamp(native_surface / mu, max=700.0)),
+            dim=-1,
+        )
+
+    reference = torch.cat([ref_top.reshape(-1), ref_surface.reshape(-1)])
+    error = torch.cat([(pred_top - ref_top).reshape(-1), (pred_surface - ref_surface).reshape(-1)])
+    scale = torch.sqrt(torch.mean(torch.square(reference))).clamp_min(EPS)
+    return torch.mean(torch.square(error / scale))
+
+
+def sw_direct_path_loss(
+    probabilities_mq: Any,
+    tau_abs_blm: Any,
+    rayleigh_blm: Any,
+    incoming_bm: Any,
+    tau_abs_blq: Any,
+    rayleigh_blq: Any,
+    incoming_bq: Any,
+    *,
+    mu_values: list[float],
+    spectral_chunk: int,
+    torch: Any,
+) -> Any:
+    """Match cumulative direct-beam SW path transmittance at model levels."""
+
+    del probabilities_mq  # The compressed tensors already carry the differentiable dependence.
+    if incoming_bq.ndim == 1:
+        incoming_bq = incoming_bq[None, :].expand(tau_abs_blq.shape[0], -1)
+    total_q = torch.clamp(tau_abs_blq + rayleigh_blq, min=0.0)
+    total_native = torch.clamp(tau_abs_blm + rayleigh_blm, min=0.0)
+    chunk = max(1, int(spectral_chunk))
+    errors = []
+    references = []
+    for raw_mu in mu_values:
+        mu = max(min(float(raw_mu), 1.0), 1.0e-6)
+        q_path, _ = _level_cumulative_tau(total_q, torch=torch)
+        pred = torch.sum(incoming_bq[:, None, :] * torch.exp(-torch.clamp(q_path / mu, max=700.0)), dim=-1)
+        ref = tau_abs_blm.new_zeros(pred.shape)
+        for start in range(0, int(total_native.shape[-1]), chunk):
+            stop = min(int(total_native.shape[-1]), start + chunk)
+            native_path, _ = _level_cumulative_tau(total_native[:, :, start:stop], torch=torch)
+            ref = ref + torch.sum(
+                incoming_bm[:, None, start:stop] * torch.exp(-torch.clamp(native_path / mu, max=700.0)),
+                dim=-1,
+            )
+        references.append(ref.reshape(-1))
+        errors.append((pred - ref).reshape(-1))
+    reference = torch.cat(references)
+    error = torch.cat(errors)
+    scale = torch.sqrt(torch.mean(torch.square(reference))).clamp_min(EPS)
+    return torch.mean(torch.square(error / scale))
+
+
+def _level_cumulative_tau(tau_blx: Any, *, torch: Any) -> tuple[Any, Any]:
+    tau = torch.clamp(tau_blx, min=0.0)
+    batch, _, count = tau.shape
+    zero = tau.new_zeros((batch, 1, count))
+    top_path = torch.cat([zero, torch.cumsum(tau, dim=1)], dim=1)
+    suffix = torch.flip(torch.cumsum(torch.flip(tau, dims=[1]), dim=1), dims=[1])
+    surface_path = torch.cat([suffix, zero], dim=1)
+    return top_path, surface_path
+
+
+def _training_float(options: dict[str, Any], canonical: str, legacy: str, *, default: float) -> float:
+    if canonical in options:
+        return float(options[canonical])
+    if legacy in options:
+        return float(options[legacy])
+    return float(default)
 
 
 def _planck_level_source(batch: NativeBatch, *, dtype: Any, device: Any, torch: Any) -> Any:

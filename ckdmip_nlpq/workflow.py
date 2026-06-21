@@ -72,7 +72,7 @@ def preflight(config: RunConfig, *, band: int, dry_run: bool = False) -> None:
         check_ckdmip_executable(config, config.domain)
     except Exception as exc:
         errors.append(str(exc))
-    if any(method in ("rt-aware", "rt-aware-nn") for method in config.methods):
+    if any(is_rt_aware_method(method) for method in config.methods):
         try:
             check_py2sess_forward_flux_available(config.py2sess_repo)
         except Exception as exc:
@@ -505,6 +505,15 @@ def training_options_for_candidate(config: RunConfig, selected: dict[str, Any]) 
         selected.get("train_pressure_min_hpa", nlpq_options.get("train_pressure_min_hpa", 0.001))
     )
     options["train_pressure_max_hpa"] = float(nlpq_options.get("train_pressure_max_hpa", 1100.0))
+    for key in (
+        "rt_aware_flux_weight",
+        "rt_aware_heating_weight",
+        "rt_aware_path_weight",
+        "rt_aware_feature_weight",
+        "lw_source_mode",
+    ):
+        if key in nlpq_options:
+            options[key] = nlpq_options[key]
     stream_key = "sw_streams" if config.domain == "sw" else "lw_streams"
     options["streams"] = int(rt_options.get(stream_key, rt_options.get("streams", options.get("streams", 4))))
     if config.domain == "sw":
@@ -530,6 +539,10 @@ def training_options_for_candidate(config: RunConfig, selected: dict[str, Any]) 
     return options
 
 
+def is_rt_aware_method(method: str) -> bool:
+    return str(method) in {"rt-aware", "rt-aware-current", "rt-aware-path", "rt-aware-nn"}
+
+
 def training_summary_fields(metadata: dict[str, Any]) -> dict[str, Any]:
     log = metadata.get("training_log", {})
     if not isinstance(log, dict):
@@ -547,6 +560,12 @@ def training_summary_fields(metadata: dict[str, Any]) -> dict[str, Any]:
         "teacher_loss_final",
         "teacher_flux_loss_final",
         "teacher_heating_loss_final",
+        "teacher_path_loss_final",
+        "rt_aware_method_variant",
+        "flux_loss_weight",
+        "heating_loss_weight",
+        "path_loss_weight",
+        "feature_loss_weight",
         "train_pressure_min_hpa",
         "train_pressure_max_hpa",
         "lw_source_mode",

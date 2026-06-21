@@ -15,6 +15,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
 from ckdmip_nlpq.config import build_output_paths, load_run_config, parse_profile_spec  # noqa: E402
+from ckdmip_nlpq.data import infer_spectral_width  # noqa: E402
 from ckdmip_nlpq.data import (  # noqa: E402
     build_download_plan,
     load_native_batch_from_ckdmip,
@@ -34,8 +35,12 @@ from ckdmip_nlpq.rt_aware import (  # noqa: E402
     compress_soft,
     compress_soft_integrated_source,
     compress_soft_level_source,
+    compress_soft_sw,
+    lw_source_path_loss,
     py2sess_forward_flux_rt,
+    sw_direct_path_loss,
 )
+from ckdmip_nlpq.export import PLANCK_C1, PLANCK_C2, _compressed_planck  # noqa: E402
 from ckdmip_nlpq.tuning import rank_candidates, write_selected_settings  # noqa: E402
 from ckdmip_nlpq.workflow import run_stage, write_vertical_outputs  # noqa: E402
 
@@ -60,6 +65,8 @@ class MinimalWorkflowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = load_run_config(write_config(Path(tmpdir), methods=["rt-aware-nn"]))
             self.assertEqual(cfg.methods, ["rt-aware-nn"])
+            cfg = load_run_config(write_config(Path(tmpdir), methods=["rt-aware-current", "rt-aware-path"]))
+            self.assertEqual(cfg.methods, ["rt-aware-current", "rt-aware-path"])
 
     def test_download_dry_run_plan_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -113,6 +120,63 @@ class MinimalWorkflowTest(unittest.TestCase):
             np.testing.assert_allclose(batch.tau_native, optical_depth[:3].astype(np.float32))
             np.testing.assert_allclose(batch.species_tau_native[:, :, 0, :], batch.tau_native)
             np.testing.assert_allclose(batch.incoming_flux_native, np.linspace(1.0, 2.0, 4))
+
+    def test_sw_rayleigh_missing_temperature_uses_absorber_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = load_run_config(write_config(root))
+            cfg.raw["run"]["species"] = [
+                {"name": "h2o", "tag": "present"},
+                {"name": "rayleigh", "tag": "present"},
+            ]
+            wavenumber = np.linspace(2600.0, 3249.0, 4)
+            pressure = np.tile(np.linspace(100.0, 1000.0, 4), (10, 1))
+            temperature = np.tile(np.linspace(220.0, 290.0, 4), (10, 1))
+            optical_depth = np.ones((10, 3, 4), dtype=np.float64) * 0.01
+            h2o_file = spectrum_path(cfg, "sw", "evaluation1", "h2o", "present", "1-10")
+            h2o_file.parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(h2o_file, "w") as handle:
+                handle["wavenumber"] = wavenumber
+                handle["optical_depth"] = optical_depth
+                handle["pressure_hl"] = pressure
+                handle["temperature_hl"] = temperature
+            rayleigh_file = spectrum_path(cfg, "sw", "evaluation1", "rayleigh", "present", "1-10")
+            with h5py.File(rayleigh_file, "w") as handle:
+                handle["wavenumber"] = wavenumber
+                handle["optical_depth"] = optical_depth * 0.1
+                handle["pressure_hl"] = pressure
+            ssi_file = ssi_path(cfg, "evaluation1")
+            ssi_file.parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(ssi_file, "w") as handle:
+                handle["wavenumber"] = wavenumber
+                handle["solar_spectral_irradiance"] = np.linspace(1.0, 2.0, 4)
+
+            batch = load_native_batch_from_ckdmip(cfg, band=2, dataset="evaluation1", profile_spec="0-1")
+            np.testing.assert_allclose(batch.temperature_hl, temperature[:2])
+            np.testing.assert_allclose(batch.rayleigh_tau_native, optical_depth[:2] * 0.1)
+
+    def test_sw_rayleigh_only_missing_temperature_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = load_run_config(write_config(root))
+            cfg.raw["run"]["species"] = [{"name": "rayleigh", "tag": "present"}]
+            wavenumber = np.linspace(2600.0, 3249.0, 4)
+            pressure = np.tile(np.linspace(100.0, 1000.0, 4), (10, 1))
+            optical_depth = np.ones((10, 3, 4), dtype=np.float64) * 0.001
+            rayleigh_file = spectrum_path(cfg, "sw", "evaluation1", "rayleigh", "present", "1-10")
+            rayleigh_file.parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(rayleigh_file, "w") as handle:
+                handle["wavenumber"] = wavenumber
+                handle["optical_depth"] = optical_depth
+                handle["pressure_hl"] = pressure
+            ssi_file = ssi_path(cfg, "evaluation1")
+            ssi_file.parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(ssi_file, "w") as handle:
+                handle["wavenumber"] = wavenumber
+                handle["solar_spectral_irradiance"] = np.linspace(1.0, 2.0, 4)
+
+            with self.assertRaisesRegex(KeyError, "temperature_hl"):
+                load_native_batch_from_ckdmip(cfg, band=2, dataset="evaluation1", profile_spec="0-1")
 
     def test_standard_scenario_scaling(self) -> None:
         self.assertAlmostEqual(species_scale_for_scenario("co2", "future"), 1120.0 / 415.0)
@@ -280,6 +344,51 @@ class MinimalWorkflowTest(unittest.TestCase):
         np.testing.assert_allclose(down_int.detach().numpy(), down_mean.detach().numpy(), rtol=1.0e-6, atol=1.0e-7)
         np.testing.assert_allclose(heat_int.detach().numpy(), heat_mean.detach().numpy(), rtol=1.0e-6, atol=1.0e-6)
 
+    def test_lw_integrated_source_matches_export_planck_moment(self) -> None:
+        batch = native_batch(profile_count=2, spectral_count=5)
+        cluster = np.array([0, 0, 1, 1, 1], dtype=np.int64)
+        q_value = 2
+        width = infer_spectral_width(batch.wavenumber)
+        total_width = float(np.sum(width))
+        exponent = PLANCK_C2 * batch.wavenumber[None, None, :] / np.maximum(batch.temperature_hl[:, :, None], 1.0)
+        spectral = PLANCK_C1 * batch.wavenumber[None, None, :] ** 3 / np.expm1(np.clip(exponent, 1.0e-12, 700.0))
+        expected = np.zeros(batch.temperature_hl.shape + (q_value,), dtype=np.float64)
+        for q in range(q_value):
+            mask = cluster == q
+            expected[:, :, q] = np.sum(spectral[:, :, mask] * width[mask][None, None, :] / total_width, axis=-1)
+        exported = _compressed_planck(batch, cluster, q_value) / total_width
+        np.testing.assert_allclose(exported, expected, rtol=1.0e-12, atol=1.0e-12)
+
+    def test_lw_source_path_loss_zero_for_identity(self) -> None:
+        import torch
+
+        batch = native_batch(profile_count=2, spectral_count=4)
+        alpha = torch.tensor(batch.spectral_weight, dtype=torch.float32)
+        tau = torch.tensor(batch.tau_native, dtype=torch.float32)
+        source = torch.tensor(0.2 + 0.01 * np.arange(2 * 4 * 4).reshape(2, 4, 4), dtype=torch.float32)
+        probabilities = torch.eye(4, dtype=torch.float32)
+        weights, tau_q, source_q, _ = compress_soft_integrated_source(
+            probabilities,
+            alpha,
+            tau,
+            source,
+            source[:, -1, :],
+            torch=torch,
+        )
+        loss = lw_source_path_loss(
+            probabilities,
+            alpha,
+            tau,
+            source,
+            tau_q,
+            source_q,
+            weights,
+            source_mode="ckdmip_integrated",
+            spectral_chunk=2,
+            torch=torch,
+        )
+        self.assertLess(float(loss), 1.0e-12)
+
     def test_lw_rt_aware_requires_py2sess_forward_flux(self) -> None:
         batch = native_batch(profile_count=2, spectral_count=4)
         model = NLPQModel(domain="lw", band=4, method="rt-aware", q_value=2, seed=4)
@@ -382,7 +491,63 @@ class MinimalWorkflowTest(unittest.TestCase):
         self.assertTrue(training_log["sw_plane_parallel"])
         self.assertEqual(training_log["sw_tau_mode"], "direct_beam")
         self.assertEqual(training_log["sw_rayleigh_mode"], "arithmetic")
+        self.assertIn("teacher_path_loss_final", training_log)
         self.assertEqual(model.metadata["compression_settings"]["sw_tau_mu_ref"], 0.5)
+
+    def test_sw_direct_path_loss_uses_cumulative_tau_over_mu0(self) -> None:
+        import torch
+
+        batch = sw_native_batch(profile_count=2, spectral_count=4)
+        tau_abs = torch.tensor(batch.tau_native, dtype=torch.float32)
+        rayleigh = torch.tensor(batch.rayleigh_tau_native, dtype=torch.float32)
+        incoming = torch.tensor(np.broadcast_to(batch.incoming_flux_native[None, :], (2, 4)), dtype=torch.float32)
+        identity = torch.eye(4, dtype=torch.float32)
+        tau_identity = tau_abs
+        rayleigh_identity = rayleigh
+        incoming_identity = incoming
+        identity_loss = sw_direct_path_loss(
+            identity,
+            tau_abs,
+            rayleigh,
+            incoming,
+            tau_identity,
+            rayleigh_identity,
+            incoming_identity,
+            mu_values=[0.5],
+            spectral_chunk=2,
+            torch=torch,
+        )
+        self.assertLess(float(identity_loss), 1.0e-12)
+
+        probabilities = torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+            dtype=torch.float32,
+        )
+        alpha = torch.tensor(batch.spectral_weight, dtype=torch.float32)
+        _, tau_q, rayleigh_q, incoming_q = compress_soft_sw(
+            probabilities,
+            alpha,
+            tau_abs,
+            rayleigh,
+            incoming,
+            tau_mode="direct_beam",
+            rayleigh_mode="arithmetic",
+            mu_ref=0.5,
+            torch=torch,
+        )
+        compressed_loss = sw_direct_path_loss(
+            probabilities,
+            tau_abs,
+            rayleigh,
+            incoming,
+            tau_q,
+            rayleigh_q,
+            incoming_q,
+            mu_values=[0.5],
+            spectral_chunk=2,
+            torch=torch,
+        )
+        self.assertGreater(float(compressed_loss), 0.0)
 
     def test_sw_rt_aware_requires_source_terms(self) -> None:
         batch = native_batch(profile_count=2, spectral_count=4)
@@ -534,7 +699,7 @@ class MinimalWorkflowTest(unittest.TestCase):
 
 def write_config(root: Path, *, train: str = "0-39", val: str = "40-49", methods: list[str] | None = None) -> Path:
     bin_dir = root / "bin"
-    bin_dir.mkdir()
+    bin_dir.mkdir(exist_ok=True)
     for exe in ("ckdmip_sw", "ckdmip_lw"):
         path = bin_dir / exe
         path.write_text("#!/bin/sh\nexit 0\n")

@@ -458,6 +458,12 @@ def load_native_batch_from_ckdmip(
     rayleigh_tau_native = None
     if rayleigh_parts:
         rayleigh_tau_native = np.sum(np.stack(rayleigh_parts, axis=0), axis=0)
+    missing_pressure = [p for p in profiles if p not in pressure_by_profile]
+    missing_temperature = [p for p in profiles if p not in temperature_by_profile]
+    if missing_pressure:
+        raise KeyError(f"missing pressure_hl for selected profiles: {missing_pressure}")
+    if missing_temperature:
+        raise KeyError(f"missing temperature_hl for selected profiles: {missing_temperature}")
     pressure_hl = np.stack([pressure_by_profile[p] for p in profiles], axis=0)
     temperature_hl = np.stack([temperature_by_profile[p] for p in profiles], axis=0)
     spectral_weight = infer_spectral_weight(selected_wavenumber)
@@ -526,15 +532,22 @@ def _read_spectrum_block(job: tuple[str, str, int, str, str, str, int, tuple[int
         selection = _contiguous_selection(mask)
         wavenumber = np.asarray(wavenumber_all[selection], dtype=np.float64)
         optical_depth = handle["optical_depth"]
-        pressure = handle["pressure_hl"]
-        temperature = handle["temperature_hl"]
+        allow_missing_state = domain == "sw" and gas == "rayleigh"
+        if "pressure_hl" not in handle and not allow_missing_state:
+            raise KeyError(f"pressure_hl not found in {path}")
+        if "temperature_hl" not in handle and not allow_missing_state:
+            raise KeyError(f"temperature_hl not found in {path}")
+        pressure = handle.get("pressure_hl")
+        temperature = handle.get("temperature_hl")
         for local_idx in range(optical_depth.shape[0]):
             profile_id = start + local_idx
             if profile_id not in profile_set:
                 continue
             tau_by_profile[profile_id] = np.asarray(optical_depth[local_idx, :, selection], dtype=dtype)
-            pressure_by_profile[profile_id] = np.asarray(pressure[local_idx], dtype=dtype)
-            temperature_by_profile[profile_id] = np.asarray(temperature[local_idx], dtype=dtype)
+            if pressure is not None:
+                pressure_by_profile[profile_id] = np.asarray(pressure[local_idx], dtype=dtype)
+            if temperature is not None:
+                temperature_by_profile[profile_id] = np.asarray(temperature[local_idx], dtype=dtype)
     return SpectrumBlockData(
         gas=gas,
         tag=tag,
