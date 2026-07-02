@@ -117,6 +117,25 @@ profiles and Evaluation-2 is used only once for final testing.
 
 ## Run
 
+AWS/local readiness checks:
+
+```bash
+python scripts/aws_preflight.py \
+  --config run_lw_band04.yaml \
+  --json-out runs/_aws_logs/preflight.json
+```
+
+Use `--require-data` after the CKDMIP files have been downloaded.  For AWS
+setup details, see `aws/README.md`.  The AWS wrapper can run multiple YAMLs and
+write per-stage logs/manifests:
+
+```bash
+python scripts/aws_run_batch.py \
+  --config run_lw_band04.yaml \
+  --config run_sw_band02.yaml \
+  --stages preflight download dev_tune final_train final_test plot report
+```
+
 Preflight:
 
 ```bash

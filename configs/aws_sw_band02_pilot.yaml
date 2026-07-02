@@ -1,0 +1,70 @@
+paths:
+  data_root: /mnt/nlpq/data
+  run_root: /mnt/nlpq/runs
+  ckdmip_bin: /mnt/nlpq/external/ckdmip/bin
+  py2sess_repo: /mnt/nlpq/external/py2sess
+
+run:
+  domain: sw
+  bands: [2]
+  run_id: aws_sw_band02_pilot
+  datasets: [evaluation1, evaluation2]
+  scenarios: [present]
+  profile_blocks: ["1-10", "11-20", "21-30", "31-40", "41-50"]
+
+split:
+  dev:
+    train_profiles: "0-39"
+    val_profiles: "40-49"
+  final:
+    train_profiles: "0-49"
+    test_dataset: evaluation2
+    test_profiles: "0-49"
+
+nlpq:
+  methods: [det, rt-aware-current, rt-aware-path]
+  q_values: [6, 9, 12, 16]
+  train_pressure_min_hpa: 0.001
+  train_pressure_max_hpa: 1100.0
+  sw_tau_mode: direct_beam
+  sw_tau_mu_ref: 0.5
+  sw_rayleigh_mode: arithmetic
+  rt_aware_flux_weight: 1.0
+  rt_aware_heating_weight: 4.0
+  rt_aware_path_weight: 0.05
+  rt_aware_feature_weight: 0.05
+  seed: 19
+
+training:
+  steps: 220
+  lr: 0.05
+  dtype: float32
+  load_dtype: float32
+  load_workers: 16
+  py2sess_max_rows: 131072
+  gradient_checkpointing: true
+  device: cuda
+  checkpoint_every_steps: 25
+
+tuning:
+  datasets: [evaluation1]
+  require_ckdmip_rt_for_selection: true
+  grid:
+    lr: [0.05]
+    steps: [220]
+    train_pressure_min_hpa: [0.001]
+  score_weights:
+    toa_flux: 1.0
+    surface_flux: 1.0
+    heating_upper: 1.0
+    heating_lower: 1.0
+
+rt:
+  train_teacher: py2sess
+  final_solver: ckdmip
+  mu_values: [0.1, 0.3, 0.5, 0.7, 0.9]
+  sw_streams: 4
+  surf_albedo: 0.15
+  sw_include_fo: true
+  sw_plane_parallel: true
+  allow_zero_rayleigh: false
